@@ -6,14 +6,16 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/netip"
 	"os/exec"
-	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gr0gu/cerberus/internal/config"
 	"github.com/gr0gu/cerberus/internal/model"
+	"github.com/gr0gu/cerberus/internal/platform"
 )
 
 // CommandRunner defines an interface for running external shell commands (enabling mocking).
@@ -156,18 +158,6 @@ func (s *Scanner) nmapBinary() string {
 	return ResolveNmapBinary("nmap")
 }
 
-func (s *Scanner) isUnprivileged() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.caps != nil {
-		return s.caps.EffectiveMode == "unprivileged"
-	}
-	if s.cfg != nil {
-		return s.cfg.ForceUnprivileged
-	}
-	return true
-}
-
 func (s *Scanner) usePrivilegedFlag() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -190,6 +180,13 @@ func (s *Scanner) RunDiscoveryScan(ctx context.Context, target string) ([]model.
 		}
 	}
 
+	// Proactively prod subnet with Stage 1 L2 sweep to wake sleeping devices and refresh ARP cache
+	if _, ipNet, err := net.ParseCIDR(target); err == nil && ipNet != nil {
+		s1Ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		_, _ = Stage1ARPSweep(s1Ctx, ipNet, s.excludedIPs())
+		cancel()
+	}
+
 	// Most addresses in a LAN sweep are unused, and an unprivileged TCP ping waits for each
 	// probe to time out. A LAN answers in well under 500 ms, so the RTT cap, one retry and a
 	// higher minimum parallelism cut a /24 sweep from about 2.5 minutes to about 35 seconds.
@@ -204,9 +201,7 @@ func (s *Scanner) RunDiscoveryScan(ctx context.Context, target string) ([]model.
 		"-oX", "-",
 	}
 
-	if s.isUnprivileged() || runtime.GOOS == "darwin" {
-		args = append(args, "-PS21,22,53,80,135,139,443,445,3000,3389,3689,5000,5353,5555,6379,7000,8008,8009,8080,62078", "-PA80,443")
-	} else if s.usePrivilegedFlag() {
+	if s.usePrivilegedFlag() {
 		args = append(args, "--privileged")
 	}
 
@@ -275,6 +270,35 @@ func (s *Scanner) RunVulnerabilityScan(ctx context.Context, targets []string) ([
 		scriptSpec += ",ssh-hostkey,ssl-cert"
 	}
 
+	// Tri-stage hybrid scanning:
+	// Stage 2 (RustScan) discovers open ports asynchronously across all 65,535 TCP ports.
+	// Stage 3 (Targeted Nmap) probes ONLY those open ports, eliminating closed-port timeout penalties.
+	if rustBin := platform.ResolveRustScan(); rustBin != "" {
+		rustCfg := DefaultRustScanConfig()
+		rustCfg.Binary = rustBin
+		openPortsMap, rErr := Stage2RustScan(ctx, targets, &rustCfg)
+		if rErr == nil {
+			macMap := make(map[string]string)
+			if entries := s.readNeighbors(ctx); entries != nil {
+				for _, n := range entries {
+					macMap[n.IP] = n.MAC
+				}
+			}
+			var stage3Targets []Stage3Target
+			for _, t := range targets {
+				stage3Targets = append(stage3Targets, Stage3Target{
+					IP:        t,
+					MAC:       macMap[t],
+					OpenPorts: openPortsMap[t],
+				})
+			}
+			results, auditErr := Stage3NmapAudit(ctx, s.runner, s.nmapBinary(), vulnScript, stage3Targets)
+			if auditErr == nil {
+				return results, nil
+			}
+		}
+	}
+
 	// nmap drops every result of a host that hits --host-timeout. Phones and routers that
 	// silently drop most of the 1000 probed ports need a few minutes over TCP connect, so the
 	// limit is generous; the whole scan stays bounded by ScanTimeout.
@@ -288,9 +312,7 @@ func (s *Scanner) RunVulnerabilityScan(ctx context.Context, targets []string) ([
 		"-oX", "-",
 	}
 
-	if s.isUnprivileged() || runtime.GOOS == "darwin" {
-		args = append(args, "-sT", "-Pn")
-	} else if s.usePrivilegedFlag() {
+	if s.usePrivilegedFlag() {
 		args = append(args, "--privileged")
 	}
 
@@ -352,6 +374,20 @@ func (s *Scanner) RunVulnerabilityScan(ctx context.Context, targets []string) ([
 		}
 	}
 	return results, nil
+}
+
+// RunHybridScan executes the complete tri-stage pipeline (L2 ARP sweep -> RustScan -> Targeted Nmap audit)
+// with real-time lifecycle event dispatching.
+func (s *Scanner) RunHybridScan(ctx context.Context, subnet *net.IPNet, vulnScript string, listener ScanEventListener) ([]model.ScanHostResult, error) {
+	engine := NewHybridEngine(s.runner)
+	return engine.RunHybridScan(ctx, EngineOptions{
+		Subnet:     subnet,
+		ExcludeIPs: s.excludedIPs(),
+		NmapBinary: s.nmapBinary(),
+		RustBinary: platform.ResolveRustScan(),
+		VulnScript: vulnScript,
+		Listener:   listener,
+	})
 }
 
 // DescribeScanError turns a scan failure into a message for the scan history. A scan cut

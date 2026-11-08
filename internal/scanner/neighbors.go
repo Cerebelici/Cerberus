@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gr0gu/cerberus/internal/model"
+	"github.com/gr0gu/cerberus/internal/platform"
 )
 
 // Neighbor is a host that the OS resolved on the local link (an ARP entry).
@@ -28,9 +29,30 @@ type NeighborSource func(ctx context.Context) ([]Neighbor, error)
 // An unprivileged TCP ping sweep cannot see hosts that drop every probed port (phones,
 // many IoT devices) and cannot read MAC addresses. The sweep still makes the kernel send
 // an ARP request to every address in the subnet, so right after it the ARP table holds
-// each host on the link that answered, with its MAC address. Only macOS is supported:
-// there the scanner always runs unprivileged. Other platforms return no entries.
+// each host on the link that answered, with its MAC address. Native OS extraction is
+// preferred via PlatformProvider (Darwin sysctl, Linux netlink, Windows iphlpapi).
 func ReadNeighborTable(ctx context.Context) ([]Neighbor, error) {
+	if p := platform.GetDefaultProvider(); p != nil {
+		entries, err := p.GetKernelARPCache()
+		if err == nil && len(entries) > 0 {
+			var neighbors []Neighbor
+			for _, e := range entries {
+				if e.IP == nil || e.MAC == nil {
+					continue
+				}
+				mac := strings.ToUpper(e.MAC.String())
+				if mac == "" || mac == "00:00:00:00:00:00" || mac == "FF:FF:FF:FF:FF:FF" {
+					continue
+				}
+				neighbors = append(neighbors, Neighbor{
+					IP:  e.IP.String(),
+					MAC: mac,
+				})
+			}
+			return neighbors, nil
+		}
+	}
+
 	if runtime.GOOS != "darwin" {
 		return nil, nil
 	}
