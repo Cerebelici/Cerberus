@@ -5,6 +5,8 @@ import {context} from '../models';
 
 export function ClearAllDevices():Promise<Record<string, any>>;
 
+export function CancelScan():Promise<Record<string, string>>;
+
 export function ClearScanHistory():Promise<Record<string, any>>;
 
 export function DeleteDevice(arg1:number):Promise<Record<string, string>>;

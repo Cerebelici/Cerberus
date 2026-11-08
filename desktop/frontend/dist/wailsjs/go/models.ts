@@ -9,7 +9,6 @@ export namespace model {
 	    scan_ports: string;
 	    discovery_interval_sec: number;
 	    vuln_interval_sec: number;
-	    unprivileged_mode: boolean;
 	    nmap_path: string;
 	
 	    static createFrom(source: any = {}) {
@@ -26,7 +25,6 @@ export namespace model {
 	        this.scan_ports = source["scan_ports"];
 	        this.discovery_interval_sec = source["discovery_interval_sec"];
 	        this.vuln_interval_sec = source["vuln_interval_sec"];
-	        this.unprivileged_mode = source["unprivileged_mode"];
 	        this.nmap_path = source["nmap_path"];
 	    }
 	}

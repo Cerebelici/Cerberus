@@ -475,6 +475,14 @@ func RequestManualScan(sched *scheduler.Scheduler, scanType string) ManualScanRe
 }
 
 func (s *Server) dispatchManualScan(w http.ResponseWriter, scanType string) {
+	if s.capabilities != nil && !s.capabilities.RawSocket && s.capabilities.EffectiveMode != "privileged" {
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":     "Privileged execution is mandatory. User must accept administrator privileges to perform network scans.",
+			"status":    "forbidden",
+			"scan_type": scanType,
+		})
+		return
+	}
 	result := RequestManualScan(s.scheduler, scanType)
 	writeJSON(w, result.HTTPStatus, result.Body)
 }

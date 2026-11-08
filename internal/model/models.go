@@ -289,7 +289,6 @@ type AppSettings struct {
 	ScanPorts            string `json:"scan_ports"`             // "" (Top 1000), "1-65535", or custom "22,80,443"
 	DiscoveryIntervalSec int    `json:"discovery_interval_sec"` // Interval between discovery scans in seconds
 	VulnIntervalSec      int    `json:"vuln_interval_sec"`      // Interval between vuln scans in seconds
-	UnprivilegedMode     bool   `json:"unprivileged_mode"`      // true = TCP Connect (--unprivileged), false = SYN
 	NmapPath             string `json:"nmap_path"`              // Detected or user-overridden Nmap path
 }
 

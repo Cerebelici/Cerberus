@@ -18,7 +18,6 @@ type Config struct {
 	VulnerabilityInterval time.Duration
 	NmapPath              string
 	VulnScript            string
-	ForceUnprivileged     bool
 	ScanTimeout           time.Duration
 	EnrollToken           string
 	IngestMaxBody         int64
@@ -88,7 +87,6 @@ func Load() *Config {
 		VulnerabilityInterval: getEnvDuration("CERBERUS_VULN_INTERVAL", 5*time.Minute),
 		NmapPath:              getEnv("CERBERUS_NMAP_PATH", "nmap"),
 		VulnScript:            getEnv("CERBERUS_VULN_SCRIPT", "vulners"),
-		ForceUnprivileged:     getEnvBool("CERBERUS_UNPRIVILEGED", false),
 		ScanTimeout:           getEnvDuration("CERBERUS_SCAN_TIMEOUT", 15*time.Minute),
 		EnrollToken:           getEnv("CERBERUS_ENROLL_TOKEN", ""),
 		IngestMaxBody:         getEnvInt64("CERBERUS_INGEST_MAX_BODY", 1048576),

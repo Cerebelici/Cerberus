@@ -6,6 +6,10 @@ export function ClearAllDevices() {
   return window['go']['main']['Bridge']['ClearAllDevices']();
 }
 
+export function CancelScan() {
+  return window['go']['main']['Bridge']['CancelScan']();
+}
+
 export function ClearScanHistory() {
   return window['go']['main']['Bridge']['ClearScanHistory']();
 }

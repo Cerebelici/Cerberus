@@ -2153,8 +2153,6 @@ components:
         vuln_interval_sec:
           type: integer
           minimum: 60
-        unprivileged_mode:
-          type: boolean
         nmap_path:
           type: string
 
