@@ -12,6 +12,7 @@ import (
 
 	"github.com/gr0gu/cerberus/internal/config"
 	"github.com/gr0gu/cerberus/internal/model"
+	"github.com/gr0gu/cerberus/internal/platform"
 )
 
 var (
@@ -93,11 +94,12 @@ func Preflight(ctx context.Context, cfg *config.Config, r CommandRunner, look fu
 	if os.Geteuid() == 0 {
 		rawSocket = true
 	} else if runtime.GOOS == "darwin" {
-		// On macOS, desktop capture uses /dev/bpf* packet filter devices.
-		// Setuid root on Nmap is explicitly avoided because Darwin kernel restricts bind()
-		// during TCP connect version probes (mksock_bind_addr error 22 -> tcpwrapped).
-		// When /dev/bpf* is readable/writable, macOS operates in privileged desktop mode.
-		if bpfFi, err := os.Stat("/dev/bpf0"); err == nil && bpfFi.Mode().Perm()&0006 != 0 {
+		// On macOS, desktop capture uses /dev/bpf* packet filter devices or the certified privileged root helper.
+		// When helper is active, or /dev/bpf* is readable/writable, macOS operates in privileged mode.
+		helper := platform.NewHelperClient()
+		if helper.IsHelperAvailable() {
+			rawSocket = true
+		} else if bpfFi, err := os.Stat("/dev/bpf0"); err == nil && bpfFi.Mode().Perm()&0006 != 0 {
 			rawSocket = true
 		} else if IsSetuidRoot(resolvedPath) {
 			rawSocket = true
@@ -123,16 +125,12 @@ func Preflight(ctx context.Context, cfg *config.Config, r CommandRunner, look fu
 	}
 	caps.RawSocket = rawSocket
 
-	// EffectiveMode = privileged iff raw && !cfg.ForceUnprivileged
-	if rawSocket && !cfg.ForceUnprivileged {
+	// EffectiveMode requires raw socket / privileged capabilities. Privileged run is mandatory.
+	if rawSocket {
 		caps.EffectiveMode = "privileged"
 	} else {
 		caps.EffectiveMode = "unprivileged"
-		// macOS always scans with TCP connect (see RunDiscoveryScan), so missing raw sockets
-		// change nothing there and the warning would only be noise.
-		if !rawSocket && !cfg.ForceUnprivileged && runtime.GOOS != "darwin" {
-			caps.Warnings = append(caps.Warnings, "raw socket access not available (requires root or cap_net_raw); running in unprivileged mode")
-		}
+		caps.Warnings = append(caps.Warnings, "raw socket access not available; privileged execution is mandatory, administrator approval required")
 	}
 
 	return caps, nil

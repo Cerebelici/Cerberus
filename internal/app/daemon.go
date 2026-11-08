@@ -36,9 +36,10 @@ type Daemon struct {
 	cancel    context.CancelFunc
 	stopOnce  sync.Once
 	errCh     chan error
-	ln        net.Listener
-	mu        sync.Mutex
-	started   bool
+	ln           net.Listener
+	eventEmitter func(event string, data any)
+	mu           sync.Mutex
+	started      bool
 }
 
 // New constructs a new Daemon instance from configuration.
@@ -124,7 +125,6 @@ func (d *Daemon) Start(ctx context.Context) error {
 		ScanPorts:            d.cfg.ScanPorts,
 		DiscoveryIntervalSec: int(d.cfg.DiscoveryInterval.Seconds()),
 		VulnIntervalSec:      int(d.cfg.VulnerabilityInterval.Seconds()),
-		UnprivilegedMode:     d.cfg.ForceUnprivileged || caps.EffectiveMode == "unprivileged",
 		NmapPath:             caps.NmapPath,
 	}
 	// An explicit CERBERUS_SUBNET is the starting target; auto-detection would replace it.
@@ -136,13 +136,21 @@ func (d *Daemon) Start(ctx context.Context) error {
 	if persistedSettings.NmapPath == "" || persistedSettings.NmapPath == "nmap" {
 		persistedSettings.NmapPath = caps.NmapPath
 	}
-	if persistedSettings.UnprivilegedMode {
-		caps.EffectiveMode = "unprivileged"
-	} else if caps.RawSocket {
+	if caps.RawSocket {
 		caps.EffectiveMode = "privileged"
 	} else {
-		persistedSettings.UnprivilegedMode = true
-		caps.EffectiveMode = "unprivileged"
+		// Privileged run is mandatory. If not privileged, user must accept / elevate.
+		log.Printf("[Daemon] Raw socket access required for mandatory privileged execution. Prompting elevation...")
+		if err := scanner.SetupPrivilegesOrInstall(ctx, caps.NmapPath); err != nil {
+			log.Printf("[Daemon] Privilege elevation deferred or failed: %v", err)
+			caps.EffectiveMode = "unprivileged"
+			caps.Warnings = append(caps.Warnings, "Privileged execution is mandatory. User must elevate privileges to perform scans.")
+		} else {
+			if refreshed, rErr := scanner.Preflight(ctx, d.cfg, &scanner.DefaultCommandRunner{}, exec.LookPath); rErr == nil && refreshed != nil {
+				caps = refreshed
+				d.caps = caps
+			}
+		}
 	}
 	d.settings = persistedSettings
 
@@ -171,6 +179,9 @@ func (d *Daemon) Start(ctx context.Context) error {
 	d.scn = scn
 
 	sched := scheduler.New(d.cfg, store, scn)
+	if d.eventEmitter != nil {
+		sched.SetEventEmitter(d.eventEmitter)
+	}
 	sched.SetLocalNetworkCheck(func(ctx context.Context) error {
 		return netdetect.WaitForLocalNetworkAccess(ctx, localNetworkWait)
 	})
@@ -552,9 +563,49 @@ func (d *Daemon) GetScans(ctx context.Context, limit int) ([]model.ScanLog, erro
 // that type is already in progress, 503 when the scheduler is not running.
 func (d *Daemon) RequestScan(scanType string) api.ManualScanResult {
 	d.mu.Lock()
+	caps := d.caps
 	sched := d.sched
 	d.mu.Unlock()
+
+	if caps != nil && !caps.RawSocket && caps.EffectiveMode != "privileged" {
+		// Privileged run is mandatory. Prompt elevation if not yet granted.
+		if _, err := d.SetupNmapAndPrivileges(context.Background()); err != nil {
+			return api.ManualScanResult{
+				HTTPStatus: http.StatusForbidden,
+				Body: map[string]string{
+					"error":     "Privileged execution is mandatory. User must accept administrator privileges to perform network scans.",
+					"status":    "forbidden",
+					"scan_type": scanType,
+				},
+			}
+		}
+		d.mu.Lock()
+		sched = d.sched
+		d.mu.Unlock()
+	}
+
 	return api.RequestManualScan(sched, scanType)
+}
+
+// SetScanEventEmitter registers an event handler for streaming scan lifecycle events to Wails/UI.
+func (d *Daemon) SetScanEventEmitter(fn func(event string, data any)) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.eventEmitter = fn
+	if d.sched != nil {
+		d.sched.SetEventEmitter(fn)
+	}
+}
+
+// CancelScan cancels the active scanning operation.
+func (d *Daemon) CancelScan() bool {
+	d.mu.Lock()
+	sched := d.sched
+	d.mu.Unlock()
+	if sched != nil {
+		return sched.CancelCurrentScan()
+	}
+	return false
 }
 
 // GetPosture returns the live fleet posture report.
@@ -628,42 +679,21 @@ func (d *Daemon) UpdateSettings(ctx context.Context, newSettings model.AppSettin
 		return nil, fmt.Errorf("no network to scan: the selected mode did not resolve to a subnet")
 	}
 
-	// Handle privilege mode toggle
-	if newSettings.UnprivilegedMode {
-		d.cfg.ForceUnprivileged = true
+	// Ensure privileged execution capability
+	if d.caps == nil || !d.caps.RawSocket {
+		if err := scanner.SetupPrivilegesOrInstall(ctx, d.cfg.NmapPath); err != nil {
+			return nil, fmt.Errorf("privileged execution is mandatory: %w", err)
+		}
+	}
+	if caps, preErr := scanner.Preflight(ctx, d.cfg, &scanner.DefaultCommandRunner{}, exec.LookPath); preErr == nil && caps != nil {
 		if d.caps != nil {
-			d.caps.EffectiveMode = "unprivileged"
-		}
-	} else {
-		d.cfg.ForceUnprivileged = false
-		if d.caps == nil || !d.caps.RawSocket {
-			if err := scanner.SetupPrivilegesOrInstall(ctx, d.cfg.NmapPath); err != nil {
-				newSettings.UnprivilegedMode = true
-				if d.caps != nil {
-					d.caps.EffectiveMode = "unprivileged"
-				}
-				return nil, fmt.Errorf("privilege elevation required for SYN/Raw socket mode: %w", err)
-			}
-		}
-		if caps, preErr := scanner.Preflight(ctx, d.cfg, &scanner.DefaultCommandRunner{}, exec.LookPath); preErr == nil && caps != nil {
-			if d.caps != nil {
-				*d.caps = *caps
-			} else {
-				d.caps = caps
-			}
-			if caps.NmapPath != "" {
-				d.cfg.NmapPath = caps.NmapPath
-				newSettings.NmapPath = caps.NmapPath
-			}
-		}
-		if d.caps != nil && d.caps.RawSocket {
-			d.caps.EffectiveMode = "privileged"
-			newSettings.UnprivilegedMode = false
+			*d.caps = *caps
 		} else {
-			newSettings.UnprivilegedMode = true
-			if d.caps != nil {
-				d.caps.EffectiveMode = "unprivileged"
-			}
+			d.caps = caps
+		}
+		if caps.NmapPath != "" {
+			d.cfg.NmapPath = caps.NmapPath
+			newSettings.NmapPath = caps.NmapPath
 		}
 	}
 
@@ -707,7 +737,6 @@ func (d *Daemon) SetupNmapAndPrivileges(ctx context.Context) (*model.Capabilitie
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	d.cfg.ForceUnprivileged = false
 	nmapTarget := d.settings.NmapPath
 	if nmapTarget == "" || nmapTarget == "nmap" {
 		nmapTarget = d.cfg.NmapPath
@@ -732,7 +761,6 @@ func (d *Daemon) SetupNmapAndPrivileges(ctx context.Context) (*model.Capabilitie
 		}
 		if caps.RawSocket {
 			d.caps.EffectiveMode = "privileged"
-			d.settings.UnprivilegedMode = false
 		}
 		if d.store != nil {
 			_ = d.store.SaveAppSettings(ctx, d.settings)

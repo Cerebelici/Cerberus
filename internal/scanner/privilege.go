@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/gr0gu/cerberus/internal/platform"
 )
 
 // Well-known candidate locations for the Nmap executable across operating systems.
@@ -106,7 +108,20 @@ func SetupPrivilegesOrInstall(ctx context.Context, nmapPath string) error {
 		return nil
 
 	case "darwin":
-		// On macOS, prompt via osascript Administrator dialog
+		// Check if the privileged root helper daemon is already active and reachable
+		helper := platform.NewHelperClient()
+		if helper.IsHelperAvailable() {
+			return nil
+		}
+
+		// Progressive enhancement: Attempt certified Touch ID / SMJobBless installation first
+		if blessErr := platform.BlessPrivilegedHelper("com.cerberus.helper"); blessErr == nil {
+			if helper.IsHelperAvailable() {
+				return nil
+			}
+		}
+
+		// Development fallback: prompt via osascript Administrator dialog
 		var script string
 		if _, err := os.Stat(resolved); err == nil {
 			realPath := resolved

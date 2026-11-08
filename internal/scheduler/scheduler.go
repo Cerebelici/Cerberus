@@ -54,6 +54,11 @@ type Scheduler struct {
 	manualVulnCh      chan chan error
 	discoveryResetCh  chan struct{}
 	vulnResetCh       chan struct{}
+
+	eventEmitter     func(event string, data any)
+	eventMu          sync.RWMutex
+	scanCancelMu     sync.Mutex
+	activeScanCancel context.CancelFunc
 }
 
 // New creates a new Scheduler.
@@ -207,6 +212,41 @@ func (s *Scheduler) runDiscoveryWorker(ctx context.Context) {
 	}
 }
 
+// SetEventEmitter registers a callback for streaming scan lifecycle events.
+func (s *Scheduler) SetEventEmitter(fn func(event string, data any)) {
+	s.eventMu.Lock()
+	defer s.eventMu.Unlock()
+	s.eventEmitter = fn
+}
+
+// EmitEvent dispatches a scan event to registered listeners.
+func (s *Scheduler) EmitEvent(event string, data any) {
+	s.eventMu.RLock()
+	fn := s.eventEmitter
+	s.eventMu.RUnlock()
+	if fn != nil {
+		fn(event, data)
+	}
+}
+
+// CancelCurrentScan aborts any active scan execution context.
+func (s *Scheduler) CancelCurrentScan() bool {
+	s.scanCancelMu.Lock()
+	defer s.scanCancelMu.Unlock()
+	if s.activeScanCancel != nil {
+		s.activeScanCancel()
+		s.activeScanCancel = nil
+		return true
+	}
+	return false
+}
+
+func (s *Scheduler) setActiveCancel(cancel context.CancelFunc) {
+	s.scanCancelMu.Lock()
+	defer s.scanCancelMu.Unlock()
+	s.activeScanCancel = cancel
+}
+
 func (s *Scheduler) executeDiscovery(ctx context.Context) error {
 	if !s.discoveryRunning.CompareAndSwap(false, true) {
 		log.Println("[Discovery Worker] Scan already in progress, skipping.")
@@ -214,7 +254,34 @@ func (s *Scheduler) executeDiscovery(ctx context.Context) error {
 	}
 	defer s.discoveryRunning.Store(false)
 
-	_, err := s.discoveryService.Run(ctx)
+	scanCtx, cancel := context.WithCancel(ctx)
+	s.setActiveCancel(cancel)
+	defer func() {
+		s.setActiveCancel(nil)
+		cancel()
+	}()
+
+	s.EmitEvent("scan:stage_changed", "Stage 1: L2 Mapping")
+	devices, err := s.discoveryService.Run(scanCtx)
+	if err == nil {
+		for _, d := range devices {
+			s.EmitEvent("scan:host_discovered", map[string]string{
+				"ip":  d.IP,
+				"mac": d.MAC,
+			})
+			if d.Hostname != "" {
+				s.EmitEvent("scan:identity_updated", map[string]string{
+					"ip":       d.IP,
+					"hostname": d.Hostname,
+					"vendor":   d.Vendor,
+				})
+			}
+		}
+		s.EmitEvent("scan:completed", map[string]any{
+			"type":    "discovery",
+			"devices": len(devices),
+		})
+	}
 	return err
 }
 
@@ -358,7 +425,15 @@ func (s *Scheduler) scanTargets(ctx context.Context, targets []string, scanType 
 		log.Printf("[%s Scan] Failed to create scan log: %v", scanType, err)
 	}
 
-	results, scanErr := s.scanner.RunVulnerabilityScan(ctx, targets)
+	scanCtx, cancel := context.WithCancel(ctx)
+	s.setActiveCancel(cancel)
+	defer func() {
+		s.setActiveCancel(nil)
+		cancel()
+	}()
+
+	s.EmitEvent("scan:stage_changed", "Stage 2: Port Sweep")
+	results, scanErr := s.scanner.RunVulnerabilityScan(scanCtx, targets)
 	duration := time.Since(start).Milliseconds()
 
 	if scanErr != nil {
@@ -372,8 +447,7 @@ func (s *Scheduler) scanTargets(ctx context.Context, targets []string, scanType 
 		}
 		return scanErr
 	}
-
-	isUnprivileged := (s.scanner.Capabilities() != nil && s.scanner.Capabilities().EffectiveMode == "unprivileged") || s.cfg.ForceUnprivileged
+	s.EmitEvent("scan:stage_changed", "Stage 3: Deep Audit")
 
 	discovery.ResolveAll(persistCtx, len(results),
 		func(i int) (string, string, string, string) {
@@ -397,9 +471,8 @@ func (s *Scheduler) scanTargets(ctx context.Context, targets []string, scanType 
 			}
 		}
 
-		// When unprivileged (-Pn), Nmap marks every target IP as "up" even if no host is listening.
-		// Skip the host BEFORE calling matcher.Resolve / ApplyDecision if 0 ports are open and no MAC was seen.
-		if isUnprivileged && len(observedPorts) == 0 && res.MAC == "" {
+		// Skip phantom targets if 0 ports are open and no MAC was observed on the link
+		if len(observedPorts) == 0 && res.MAC == "" {
 			continue
 		}
 
@@ -495,6 +568,12 @@ func (s *Scheduler) scanTargets(ctx context.Context, targets []string, scanType 
 			log.Printf("[%s Scan] Error creating posture snapshot: %v", scanType, snapErr)
 		}
 	}
+
+	s.EmitEvent("scan:completed", map[string]any{
+		"type":        scanType,
+		"results":     len(results),
+		"duration_ms": duration,
+	})
 
 	return nil
 }

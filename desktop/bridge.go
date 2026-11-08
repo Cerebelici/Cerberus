@@ -211,6 +211,14 @@ func (b *Bridge) TriggerVulnerabilityScan() (map[string]string, error) {
 	return b.requestScan(api.ScanTypeVulnerability)
 }
 
+// CancelScan terminates the active network scan immediately without orphan processes.
+func (b *Bridge) CancelScan() (map[string]string, error) {
+	if b.d.CancelScan() {
+		return map[string]string{"status": "cancelled"}, nil
+	}
+	return map[string]string{"status": "idle"}, nil
+}
+
 func (b *Bridge) requestScan(scanType string) (map[string]string, error) {
 	result := b.d.RequestScan(scanType)
 	if result.HTTPStatus >= http.StatusInternalServerError {

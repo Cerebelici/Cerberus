@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.cerberus.helper</string>
+    <key>MachServices</key>
+    <dict>
+        <key>com.cerberus.helper</key>
+        <true/>
+    </dict>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/PrivilegedHelperTools/com.cerberus.helper</string>
+    </array>
+    <key>StandardErrorPath</key>
+    <string>/var/log/com.cerberus.helper.err.log</string>
+    <key>StandardOutPath</key>
+    <string>/var/log/com.cerberus.helper.out.log</string>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>

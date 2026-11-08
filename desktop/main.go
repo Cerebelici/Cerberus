@@ -59,6 +59,9 @@ func main() {
 			logs.Subscribe(func(entry logstream.Entry) {
 				runtime.EventsEmit(ctx, "cerberus:log", entry)
 			})
+			d.SetScanEventEmitter(func(event string, data any) {
+				runtime.EventsEmit(ctx, event, data)
+			})
 			if err := d.Start(context.Background()); err != nil {
 				runtime.MessageDialog(ctx, runtime.MessageDialogOptions{
 					Type:    runtime.ErrorDialog,

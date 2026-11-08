@@ -28,6 +28,11 @@ type DefaultCommandRunner struct{}
 
 // Run executes the command with context and returns stdout.
 func (r *DefaultCommandRunner) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
+	helper := platform.NewHelperClient()
+	if helper.IsHelperAvailable() {
+		return helper.ExecutePrivileged(ctx, name, args...)
+	}
+
 	cmd := exec.CommandContext(ctx, name, args...)
 	configureProcessGroup(cmd)
 	var stdout, stderr bytes.Buffer
