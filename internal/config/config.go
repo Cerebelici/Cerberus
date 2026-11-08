@@ -20,7 +20,6 @@ type Config struct {
 	VulnScript            string
 	ForceUnprivileged     bool
 	ScanTimeout           time.Duration
-	SeedMockData          bool
 	EnrollToken           string
 	IngestMaxBody         int64
 	IngestShards          int
@@ -91,7 +90,6 @@ func Load() *Config {
 		VulnScript:            getEnv("CERBERUS_VULN_SCRIPT", "vulners"),
 		ForceUnprivileged:     getEnvBool("CERBERUS_UNPRIVILEGED", false),
 		ScanTimeout:           getEnvDuration("CERBERUS_SCAN_TIMEOUT", 15*time.Minute),
-		SeedMockData:          getEnvBool("CERBERUS_MOCK_DATA", false),
 		EnrollToken:           getEnv("CERBERUS_ENROLL_TOKEN", ""),
 		IngestMaxBody:         getEnvInt64("CERBERUS_INGEST_MAX_BODY", 1048576),
 		IngestShards:          getEnvInt("CERBERUS_INGEST_SHARDS", runtime.GOMAXPROCS(0)),

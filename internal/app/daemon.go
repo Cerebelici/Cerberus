@@ -118,11 +118,6 @@ func (d *Daemon) Start(ctx context.Context) error {
 		log.Printf("[Daemon] Warning: %d scan(s) of the previous run did not finish; recorded them as interrupted", n)
 	}
 
-	// Optional mock data seeding
-	if d.cfg.SeedMockData {
-		_ = store.SeedMockData(context.Background())
-	}
-
 	// 3. Load or initialize application settings
 	defaultSettings := model.AppSettings{
 		NetworkMode:          "auto",

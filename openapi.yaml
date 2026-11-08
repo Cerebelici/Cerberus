@@ -58,15 +58,6 @@ info:
 
     {% endtab %}
 
-
-    {% tab title="Docker Container" %}
-
-    **Base URL**
-
-    `http://172.28.0.5:8080`
-
-    {% endtab %}
-
     {% tab title="Custom Host" %}
 
     **Base URL**
@@ -158,8 +149,6 @@ info:
 servers:
   - url: http://localhost:8080
     description: Localhost Daemon
-  - url: http://172.28.0.5:8080
-    description: Docker Bridge (sentinel-net)
 tags:
   - name: inventory-group
     x-page-title: Inventory

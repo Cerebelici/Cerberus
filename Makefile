@@ -1,4 +1,4 @@
-.PHONY: build-headless build-desktop setcap-nmap test test-race lint
+.PHONY: build-headless build-desktop setcap-nmap lint
 
 build-headless:
 	CGO_ENABLED=0 go build -o bin/sentinel ./cmd/sentinel
@@ -15,12 +15,6 @@ setcap-nmap:
 		echo "nmap binary not found in PATH"; \
 		exit 1; \
 	fi
-
-test:
-	go test ./...
-
-test-race:
-	go test -race ./...
 
 lint:
 	go vet ./...

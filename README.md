@@ -35,7 +35,7 @@ In modern networks, a device's IP address can change whenever it reconnects (via
 2. **Step 2 — Deep Service & Key Check (`RunVulnerabilityScan`, `-sV`)**: Cerberus scans the device's open ports, security vulnerabilities, and digital keys (SSH keys, SSL certificates). Once this scan finishes, Cerberus re-checks the device against offline history: if its digital keys (**Tier 1**) or its hostname + open ports (**Tier 3**) match an earlier device, Cerberus automatically merges the temporary record into the original device so all timeline history and alerts stay in one place.
 
 ### Built-In Safeguards Against Duplicate Devices
-- **Ignoring Ghost Hosts in Unprivileged Mode (`-Pn`)**: When running without raw-socket privileges (`CERBERUS_UNPRIVILEGED=true`), Nmap uses `-Pn`, which reports every scanned IP as "online" even if no device is actually listening there. Cerberus filters out any `-Pn` result that has both zero open ports and no MAC address *before* running identity matching, so offline or old mock IPs (such as `172.28.0.50` from initial seed data) never create phantom device records.
+- **Ignoring Ghost Hosts in Unprivileged Mode (`-Pn`)**: When running without raw-socket privileges (`CERBERUS_UNPRIVILEGED=true`), Nmap uses `-Pn`, which reports every scanned IP as "online" even if no device is actually listening there. Cerberus filters out any `-Pn` result that has both zero open ports and no MAC address *before* running identity matching, so inactive or non-responsive IPs never create phantom device records.
 - **Handling Scans Without MAC Addresses**: When Nmap scans across a network where MAC addresses aren't visible (such as unprivileged TCP scans or local container interfaces), Cerberus keeps linking the scan result to the active device holding that IP lease (`IPLease + IPOnlyLease`) rather than creating a new device on every scan. The same applies when a device recorded without a MAC is seen with one for the first time. Empty IP-only records never compete with a device that holds the same IP lease; binding merges them into it.
 - **MAC Addresses from the ARP Table (macOS)**: macOS always scans with unprivileged TCP connect, which cannot read MAC addresses and misses hosts that drop every probed port (phones, many IoT devices). After each sweep, Cerberus reads the ARP entries the OS confirmed during the sweep (`arp -anx`, entries with a running timer only): it fills the MAC of every found host and adds hosts that answered ARP but no TCP probe. Vendors come from the `nmap-mac-prefixes` database installed with nmap.
 - **One Active Device Per IP**: Cerberus deduplicates target IPs before every scan and automatically marks any older device record at the same IP as `down` when a new device takes over that address, preventing duplicate entries from accumulating.
@@ -44,42 +44,17 @@ In modern networks, a device's IP address can change whenever it reconnects (via
 
 ## Deployment & Launch Guides
 
-Cerberus supports three primary deployment topologies:
+Cerberus supports two primary deployment topologies:
 
 ```
 [ Deployment Scenarios ]
-1. Local Docker Sandbox      -> Isolated bridge network with container targets (Nginx, Redis, DVWA)
-2. Distributed VMs + Tailscale-> Overlay mesh VPN connecting Sentinel to remote Linux VMs
-3. Real Physical Network      -> Host LAN sweeps (Wi-Fi/Ethernet) + physical Linux server probes
+1. Distributed VMs + Tailscale-> Overlay mesh VPN connecting Sentinel to remote Linux VMs
+2. Real Physical Network      -> Host LAN sweeps (Wi-Fi/Ethernet) + physical Linux server probes
 ```
 
 ---
 
-### Scenario 1: Local Docker Compose (Fast Sandbox / Testbed)
-
-Best for local testing and validation. Spawns an isolated bridge subnet (`172.28.0.0/24`) containing vulnerable test targets (Nginx, Redis, DVWA) alongside the Sentinel container.
-
-1. **Start the testbed**:
-   ```bash
-   docker compose up -d --build
-   ```
-2. **Verify container status**:
-   ```bash
-   docker compose ps
-   ```
-3. **Access the Sentinel API**:
-   - Healthcheck: `http://localhost:8080/health`
-   - System Status & Capabilities: `http://localhost:8080/api/status`
-   - Discovered Devices: `http://localhost:8080/api/devices`
-   - Fleet Security Posture: `http://localhost:8080/api/posture`
-4. **Trigger an on-demand discovery sweep**:
-   ```bash
-   curl -X POST http://localhost:8080/api/scans/discovery/trigger
-   ```
-
----
-
-### Scenario 2: Distributed Setup across VMs using Tailscale
+### Scenario 1: Distributed Setup across VMs using Tailscale
 
 Best for multi-node labs, hybrid environments, or cloud VMs across different clouds/VPCs without requiring port forwarding or public IP exposure.
 
@@ -135,7 +110,7 @@ sudo ./proc_exec \
 
 ---
 
-### Scenario 3: Real Physical Devices in a Real Network (LAN / Wi-Fi)
+### Scenario 2: Real Physical Devices in a Real Network (LAN / Wi-Fi)
 
 Best for home labs, office subnets, or dedicated security appliance deployments monitoring physical workstations, IoT devices, printers, and servers.
 
