@@ -3,9 +3,9 @@
 import {model} from '../models';
 import {context} from '../models';
 
-export function ClearAllDevices():Promise<Record<string, any>>;
-
 export function CancelScan():Promise<Record<string, string>>;
+
+export function ClearAllDevices():Promise<Record<string, any>>;
 
 export function ClearScanHistory():Promise<Record<string, any>>;
 
