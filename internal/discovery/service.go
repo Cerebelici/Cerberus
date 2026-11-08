@@ -192,17 +192,62 @@ func (s *Service) Run(ctx context.Context) ([]model.Device, error) {
 	return devices, nil
 }
 
-// resolveNames fills hostnames and vendors of discovered devices.
+// resolveNames fills hostnames, vendors, and classifications of discovered devices.
 func resolveNames(ctx context.Context, devices []model.Device) {
+	if len(devices) == 0 {
+		return
+	}
+
+	// 1. Multi-Channel Identity Resolver (Bonjour, NetBIOS, Router PTR, UPnP, Sleeping Mobile Heuristic)
+	inputs := make([]identity.HostIdentityInput, len(devices))
+	for i, d := range devices {
+		inputs[i] = identity.HostIdentityInput{
+			IP:             d.IP,
+			MAC:            d.MAC,
+			RespondedL2ARP: d.MAC != "",
+			ExistingHost:   d.Hostname,
+			ExistingVendor: d.Vendor,
+		}
+	}
+
+	resolver := identity.NewMultiChannelResolver()
+	classifications := resolver.ResolveBatch(ctx, inputs)
+
+	for i := range devices {
+		if cl, ok := classifications[devices[i].IP]; ok {
+			if devices[i].Hostname == "" {
+				if cl.Hostname != "" {
+					devices[i].Hostname = cl.Hostname
+				} else if cl.FriendlyName != "" {
+					devices[i].Hostname = cl.FriendlyName
+				}
+			}
+			if devices[i].Vendor == "" && cl.Manufacturer != "" {
+				devices[i].Vendor = cl.Manufacturer
+			}
+			if cl.Confidence > 0 {
+				devices[i].IdentityConfidence = cl.Confidence
+			}
+			if cl.DeviceType != "" && devices[i].Notes == "" {
+				if cl.OSFamily != "" {
+					devices[i].Notes = fmt.Sprintf("%s (%s)", cl.DeviceType, cl.OSFamily)
+				} else {
+					devices[i].Notes = cl.DeviceType
+				}
+			}
+		}
+	}
+
+	// 2. Fallback to standard mDNS, NetBIOS, and vendor prefix database for any unresolved fields
 	ResolveAll(ctx, len(devices),
 		func(i int) (string, string, string, string) {
 			return devices[i].IP, devices[i].Hostname, devices[i].Vendor, devices[i].MAC
 		},
 		func(i int, host, vendor string) {
-			if host != "" {
+			if host != "" && devices[i].Hostname == "" {
 				devices[i].Hostname = host
 			}
-			if vendor != "" {
+			if vendor != "" && devices[i].Vendor == "" {
 				devices[i].Vendor = vendor
 			}
 		})
