@@ -99,6 +99,7 @@ Section
     # Unpack bundled scanning engines (RustScan, portable Nmap) into $INSTDIR\tools
     SetOutPath "$INSTDIR\tools"
     File /nonfatal /r "..\..\bin\tools\*.*"
+    File /nonfatal /r "..\..\..\tools\*.*"
     SetOutPath $INSTDIR
 
     CreateShortcut "$SMPROGRAMS\${INFO_PRODUCTNAME}.lnk" "$INSTDIR\${PRODUCT_EXECUTABLE}"

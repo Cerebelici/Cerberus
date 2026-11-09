@@ -17,8 +17,12 @@ chmod 0755 "${PKG_DIR}/opt/cerberus/bin/cerberus-desktop"
 ln -sf "/opt/cerberus/bin/cerberus-desktop" "${PKG_DIR}/usr/bin/cerberus-desktop"
 ln -sf "/opt/cerberus/bin/cerberus-desktop" "${PKG_DIR}/usr/bin/cerberus"
 
-if [ -d "build/bin/tools" ]; then
-  echo "==> Bundling portable engines into /opt/cerberus/bin/"
+if [ -d "tools" ]; then
+  echo "==> Bundling portable engines from tools/ into /opt/cerberus/bin/"
+  cp -R tools/* "${PKG_DIR}/opt/cerberus/bin/"
+  chmod -R 0755 "${PKG_DIR}/opt/cerberus/bin"
+elif [ -d "build/bin/tools" ]; then
+  echo "==> Bundling portable engines from build/bin/tools into /opt/cerberus/bin/"
   cp -R build/bin/tools/* "${PKG_DIR}/opt/cerberus/bin/"
   chmod -R 0755 "${PKG_DIR}/opt/cerberus/bin"
 fi

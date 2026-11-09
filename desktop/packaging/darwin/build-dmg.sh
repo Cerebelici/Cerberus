@@ -3,6 +3,9 @@ set -euo pipefail
 
 OUTPUT_DMG="${1:-../Cerberus-macOS-universal.dmg}"
 APP_SRC="build/bin/cerberus.app"
+if [ ! -d "${APP_SRC}" ] && [ -d "build/bin/Cerberus.app" ]; then
+  APP_SRC="build/bin/Cerberus.app"
+fi
 
 if [ ! -d "${APP_SRC}" ]; then
   echo "Error: ${APP_SRC} not found"
@@ -13,8 +16,12 @@ fi
 plutil -lint "${APP_SRC}/Contents/Info.plist"
 
 # 2. Inject bundled tools into App Bundle Resources if present
-if [ -d "build/bin/tools" ]; then
-  echo "==> Injecting bundled engines into ${APP_SRC}/Contents/Resources/bin"
+if [ -d "tools" ]; then
+  echo "==> Injecting bundled engines from tools/ into ${APP_SRC}/Contents/Resources/bin"
+  mkdir -p "${APP_SRC}/Contents/Resources/bin"
+  cp -R tools/* "${APP_SRC}/Contents/Resources/bin/"
+elif [ -d "build/bin/tools" ]; then
+  echo "==> Injecting bundled engines from build/bin/tools into ${APP_SRC}/Contents/Resources/bin"
   mkdir -p "${APP_SRC}/Contents/Resources/bin"
   cp -R build/bin/tools/* "${APP_SRC}/Contents/Resources/bin/"
 fi

@@ -15,7 +15,7 @@ permissions:
   contents: write
 
 env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE20: 'true'
 
 jobs:
   build:
@@ -51,7 +51,6 @@ jobs:
           else
             VERSION="${{ github.ref_name }}"
           fi
-          # Strip leading 'v'
           PLAIN_VERSION="${VERSION#v}"
           echo "RELEASE_VERSION=${VERSION}" >> $GITHUB_ENV
           echo "PLAIN_VERSION=${PLAIN_VERSION}" >> $GITHUB_ENV
@@ -71,19 +70,11 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev build-essential nsis nmap unzip
-
-      - name: Install Windows NSIS
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          choco install nsis -y
-          echo "C:\Program Files (x86)\NSIS" >> $GITHUB_PATH
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev build-essential nmap unzip
 
       - name: Install Wails CLI
         shell: bash
         run: |
-          # Keep in sync with github.com/wailsapp/wails/v2 in go.mod.
           go install github.com/wailsapp/wails/v2/cmd/wails@v2.16.0
 
       - name: Build Frontend (CerberusFront)
@@ -102,64 +93,83 @@ jobs:
           fi
 
       # -----------------------------------------------------------------------
-      # ZERO-PREREQUISITE BUNDLED ENGINES PREPARATION
+      # ZERO-PREREQUISITE BUNDLED ENGINES PREPARATION (STAGED IN desktop/tools)
       # -----------------------------------------------------------------------
       - name: Prepare Windows Bundled Engines
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path desktop/build/bin/tools/nmap
+          New-Item -ItemType Directory -Force -Path desktop/tools/nmap
 
           # Fetch RustScan Windows x86_64
           Invoke-WebRequest -Uri "https://github.com/bee-san/RustScan/releases/download/2.4.1/x86_64-windows-rustscan.exe.zip" -OutFile "rustscan.zip"
-          7z e rustscan.zip -odesktop/build/bin/tools/ rustscan.exe
+          7z e rustscan.zip -odesktop/tools/ rustscan.exe
           Remove-Item -Force rustscan.zip
 
           # Extract Portable Nmap Engine from Official Installer
           Invoke-WebRequest -Uri "https://nmap.org/dist/nmap-7.95-setup.exe" -OutFile "nmap-setup.exe"
-          7z e nmap-setup.exe -odesktop/build/bin/tools/nmap nmap.exe libcrypto-3.dll libssl-3.dll libssh2.dll zlibwapi.dll nmap-service-probes nmap-services nmap-os-db -r
+          7z e nmap-setup.exe -odesktop/tools/nmap nmap.exe libcrypto-3.dll libssl-3.dll libssh2.dll zlibwapi.dll nmap-service-probes nmap-services nmap-os-db -r
           Remove-Item -Force nmap-setup.exe
 
       - name: Prepare macOS Bundled Engines
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          mkdir -p desktop/build/bin/tools/nmap
+          mkdir -p desktop/tools/nmap
 
           # Fetch and build Universal RustScan binary (Apple Silicon + Intel)
           curl -sL -O "https://github.com/bee-san/RustScan/releases/download/2.4.1/aarch64-macos-rustscan.tar.gz.zip"
           curl -sL -O "https://github.com/bee-san/RustScan/releases/download/2.4.1/x86_64-macos-rustscan.tar.gz.zip"
           unzip -q aarch64-macos-rustscan.tar.gz.zip && tar -xzf aarch64-macos-rustscan.tar.gz && mv rustscan rustscan_arm64
           unzip -q x86_64-macos-rustscan.tar.gz.zip && tar -xzf x86_64-macos-rustscan.tar.gz && mv rustscan rustscan_x86
-          lipo -create rustscan_arm64 rustscan_x86 -output desktop/build/bin/tools/rustscan
-          chmod +x desktop/build/bin/tools/rustscan
+          lipo -create rustscan_arm64 rustscan_x86 -output desktop/tools/rustscan
+          chmod +x desktop/tools/rustscan
           rm -f rustscan_arm64 rustscan_x86 *.tar.gz *.zip
 
-          # Fetch Official Nmap Service Probes & Signatures
-          curl -sL -o desktop/build/bin/tools/nmap/nmap-service-probes https://raw.githubusercontent.com/nmap/nmap/master/nmap-service-probes
-          curl -sL -o desktop/build/bin/tools/nmap/nmap-services https://raw.githubusercontent.com/nmap/nmap/master/nmap-services
+          # Extract Official Standalone macOS Nmap binary and data files
+          mkdir -p /tmp/nmap_extract /tmp/nmap_mnt
+          if curl -sL -f -o /tmp/nmap-7.95.dmg https://nmap.org/dist/nmap-7.95.dmg; then
+            hdiutil attach /tmp/nmap-7.95.dmg -nobrowse -mountpoint /tmp/nmap_mnt
+            pkgutil --expand /tmp/nmap_mnt/nmap-7.95.mpkg /tmp/nmap_extract
+            hdiutil detach /tmp/nmap_mnt
+            rm -f /tmp/nmap-7.95.dmg
+            (cd /tmp/nmap_extract/nmap.pkg && gzcat Payload | cpio -idm "./bin/nmap" "./share/nmap/*")
+            mv /tmp/nmap_extract/nmap.pkg/bin/nmap desktop/tools/nmap/nmap
+            mv /tmp/nmap_extract/nmap.pkg/share/nmap/* desktop/tools/nmap/
+            chmod +x desktop/tools/nmap/nmap
+            rm -rf /tmp/nmap_extract
+          fi
+
+          # Fallback: if DMG extraction was skipped or failed, download core signatures directly
+          if [ ! -f "desktop/tools/nmap/nmap-service-probes" ]; then
+            curl -sL -o desktop/tools/nmap/nmap-service-probes https://raw.githubusercontent.com/nmap/nmap/master/nmap-service-probes
+            curl -sL -o desktop/tools/nmap/nmap-services https://raw.githubusercontent.com/nmap/nmap/master/nmap-services
+          fi
+          if [ ! -f "desktop/tools/nmap/nmap" ] && [ -f "/opt/homebrew/bin/nmap" ]; then
+            cp /opt/homebrew/bin/nmap desktop/tools/nmap/nmap
+          fi
 
       - name: Prepare Linux Bundled Engines
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          mkdir -p desktop/build/bin/tools/nmap
+          mkdir -p desktop/tools/nmap
 
           # Fetch Static-PIE Linux RustScan binary
           curl -sL -O "https://github.com/bee-san/RustScan/releases/download/2.4.1/x86_64-linux-rustscan.tar.gz.zip"
           unzip -q x86_64-linux-rustscan.tar.gz.zip
-          tar -xzf *.tar.gz
-          cp rustscan desktop/build/bin/tools/
+          tar -xzf x86_64-linux-rustscan.tar.gz
+          cp rustscan desktop/tools/
           rm -rf rustscan *.tar.gz *.zip
 
           # Copy system Nmap and probe signatures
           if [ -f "/usr/bin/nmap" ]; then
-            cp /usr/bin/nmap desktop/build/bin/tools/nmap/
+            cp /usr/bin/nmap desktop/tools/nmap/
           fi
           if [ -d "/usr/share/nmap" ]; then
-            cp /usr/share/nmap/nmap-service-probes /usr/share/nmap/nmap-services desktop/build/bin/tools/nmap/ 2>/dev/null || true
+            cp /usr/share/nmap/nmap-service-probes /usr/share/nmap/nmap-services desktop/tools/nmap/ 2>/dev/null || true
           fi
-          chmod -R 0755 desktop/build/bin/tools
+          chmod -R 0755 desktop/tools
 
       # -----------------------------------------------------------------------
       # APPLICATION COMPILATION AND PACKAGING
@@ -170,6 +180,17 @@ jobs:
         run: |
           cd desktop
           wails build -platform ${{ matrix.platform }} -clean
+
+          APP_DIR="build/bin/cerberus.app"
+          if [ ! -d "${APP_DIR}" ] && [ -d "build/bin/Cerberus.app" ]; then
+            APP_DIR="build/bin/Cerberus.app"
+          fi
+
+          # Inject staged tools into the compiled .app bundle
+          mkdir -p "${APP_DIR}/Contents/Resources/bin"
+          cp -R tools/* "${APP_DIR}/Contents/Resources/bin/"
+          codesign --force --deep --sign - "${APP_DIR}"
+
           chmod +x packaging/darwin/build-dmg.sh
           ./packaging/darwin/build-dmg.sh "../${{ matrix.artifact_name }}"
 
@@ -179,6 +200,11 @@ jobs:
         run: |
           cd desktop
           wails build -platform ${{ matrix.platform }} -tags webkit2_41 -clean
+
+          # Stage tools into build/bin so build-deb.sh includes them
+          mkdir -p build/bin/tools
+          cp -R tools/* build/bin/tools/
+
           chmod +x packaging/linux/build-deb.sh
           ./packaging/linux/build-deb.sh "${PLAIN_VERSION}" "../${{ matrix.artifact_name }}"
 
@@ -187,12 +213,23 @@ jobs:
         shell: bash
         run: |
           cd desktop
-          wails build -platform ${{ matrix.platform }} -nsis -clean
+
+          # Populate tools into build/bin before NSIS runs
+          mkdir -p build/bin/tools
+          cp -R tools/* build/bin/tools/
+
+          # Build with NSIS (without -clean so staged tools remain intact)
+          wails build -platform ${{ matrix.platform }} -nsis
+
           ls -la build/bin/
           if ls build/bin/*installer.exe 1> /dev/null 2>&1; then
             cp build/bin/*installer.exe ../${{ matrix.artifact_name }}
-          elif ls build/bin/*.exe 1> /dev/null 2>&1; then
-            cp build/bin/*.exe ../${{ matrix.artifact_name }}
+          elif [ -f "build/bin/cerberus-desktop.exe" ]; then
+            cp build/bin/cerberus-desktop.exe ../${{ matrix.artifact_name }}
+          elif [ -f "build/bin/Cerberus.exe" ]; then
+            cp build/bin/Cerberus.exe ../${{ matrix.artifact_name }}
+          elif [ -f "build/bin/cerberus.exe" ]; then
+            cp build/bin/cerberus.exe ../${{ matrix.artifact_name }}
           else
             echo "Error: no windows executable found in build/bin/"
             exit 1
