@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -71,13 +72,20 @@ func (c *HelperClient) ExecutePrivileged(ctx context.Context, binary string, arg
 	}
 	defer conn.Close()
 
+	params := map[string]any{
+		"binary": binary,
+		"args":   args,
+	}
+	if tools, err := ResolveBundledTools(); err == nil && tools != nil && tools.NmapDir != "" {
+		if strings.Contains(strings.ToLower(binary), "nmap") {
+			params["env"] = []string{"NMAPDIR=" + tools.NmapDir}
+		}
+	}
+
 	req := map[string]any{
 		"id":     "exec",
 		"method": "Execute",
-		"params": map[string]any{
-			"binary": binary,
-			"args":   args,
-		},
+		"params": params,
 	}
 	data, _ := json.Marshal(req)
 	data = append(data, '\n')

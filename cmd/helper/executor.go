@@ -19,12 +19,15 @@ func NewRootExecutor() *RootExecutor {
 	return &RootExecutor{}
 }
 
-// Execute runs the specified binary with args and returns stdout/stderr.
-func (e *RootExecutor) Execute(ctx context.Context, binary string, args ...string) ([]byte, error) {
+// Execute runs the specified binary with args, environment, and returns stdout/stderr.
+func (e *RootExecutor) Execute(ctx context.Context, binary string, env []string, args ...string) ([]byte, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	cmd := exec.CommandContext(ctx, binary, args...)
+	if len(env) > 0 {
+		cmd.Env = append(cmd.Environ(), env...)
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

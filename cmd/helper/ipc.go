@@ -31,6 +31,7 @@ type JSONRPCResponse struct {
 type ExecuteParams struct {
 	Binary string   `json:"binary"`
 	Args   []string `json:"args"`
+	Env    []string `json:"env,omitempty"`
 }
 
 // IPCServer manages the Unix Domain Socket listener.
@@ -151,7 +152,7 @@ func (s *IPCServer) dispatch(conn net.Conn, req JSONRPCRequest) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
 
-		out, err := s.executor.Execute(ctx, params.Binary, params.Args...)
+		out, err := s.executor.Execute(ctx, params.Binary, params.Env, params.Args...)
 		if err != nil {
 			s.sendError(conn, req.ID, fmt.Sprintf("%v (output: %s)", err, string(out)))
 			return

@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -35,6 +36,11 @@ func (r *DefaultCommandRunner) Run(ctx context.Context, name string, args ...str
 
 	cmd := exec.CommandContext(ctx, name, args...)
 	configureProcessGroup(cmd)
+	if tools, err := platform.ResolveBundledTools(); err == nil && tools != nil && tools.NmapDir != "" {
+		if strings.Contains(strings.ToLower(name), "nmap") {
+			cmd.Env = append(os.Environ(), "NMAPDIR="+tools.NmapDir)
+		}
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

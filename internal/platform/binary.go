@@ -95,11 +95,21 @@ func ResolveBinaryPath(name string) string {
 
 // ResolveNmap returns the best path for nmap.
 func ResolveNmap() string {
+	if tools, err := ResolveBundledTools(); err == nil && tools != nil && tools.NmapPath != "" {
+		if fi, err := os.Stat(tools.NmapPath); err == nil && !fi.IsDir() {
+			return tools.NmapPath
+		}
+	}
 	return ResolveBinaryPath("nmap")
 }
 
 // ResolveRustScan returns the best path for rustscan, or empty string if not found.
 func ResolveRustScan() string {
+	if tools, err := ResolveBundledTools(); err == nil && tools != nil && tools.RustScanPath != "" {
+		if fi, err := os.Stat(tools.RustScanPath); err == nil && !fi.IsDir() {
+			return tools.RustScanPath
+		}
+	}
 	p := ResolveBinaryPath("rustscan")
 	if p == "rustscan" {
 		if _, err := exec.LookPath("rustscan"); err != nil {
