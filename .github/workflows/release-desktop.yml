@@ -131,18 +131,27 @@ jobs:
           rm -f rustscan_arm64 rustscan_x86 *.tar.gz *.zip
 
           # Extract Official Standalone macOS Nmap binary and data files
-          mkdir -p /tmp/nmap_extract /tmp/nmap_mnt
+          rm -rf /tmp/nmap_extract /tmp/nmap_mnt
+          mkdir -p /tmp/nmap_mnt
           if curl -sL -f -o /tmp/nmap-7.95.dmg https://nmap.org/dist/nmap-7.95.dmg; then
             hdiutil attach /tmp/nmap-7.95.dmg -nobrowse -mountpoint /tmp/nmap_mnt
             pkgutil --expand /tmp/nmap_mnt/nmap-7.95.mpkg /tmp/nmap_extract
-            hdiutil detach /tmp/nmap_mnt
+            hdiutil detach /tmp/nmap_mnt 2>/dev/null || true
             rm -f /tmp/nmap-7.95.dmg
-            (cd /tmp/nmap_extract/nmap.pkg && gzcat Payload | cpio -idm "./bin/nmap" "./share/nmap/*")
-            mv /tmp/nmap_extract/nmap.pkg/bin/nmap desktop/tools/nmap/nmap
-            mv /tmp/nmap_extract/nmap.pkg/share/nmap/* desktop/tools/nmap/
-            chmod +x desktop/tools/nmap/nmap
+            if [ -d "/tmp/nmap_extract/nmap.pkg" ]; then
+              (cd /tmp/nmap_extract/nmap.pkg && gzcat Payload | cpio -idm "./bin/nmap" "./share/nmap/*")
+              if [ -f "/tmp/nmap_extract/nmap.pkg/bin/nmap" ]; then
+                mv /tmp/nmap_extract/nmap.pkg/bin/nmap desktop/tools/nmap/nmap
+              fi
+              if [ -d "/tmp/nmap_extract/nmap.pkg/share/nmap" ]; then
+                mv /tmp/nmap_extract/nmap.pkg/share/nmap/* desktop/tools/nmap/
+              fi
+              chmod +x desktop/tools/nmap/nmap 2>/dev/null || true
+            fi
             rm -rf /tmp/nmap_extract
           fi
+          hdiutil detach /tmp/nmap_mnt 2>/dev/null || true
+          rm -rf /tmp/nmap_mnt
 
           # Fallback: if DMG extraction was skipped or failed, download core signatures directly
           if [ ! -f "desktop/tools/nmap/nmap-service-probes" ]; then
