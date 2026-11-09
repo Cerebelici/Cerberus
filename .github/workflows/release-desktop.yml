@@ -19,6 +19,7 @@ env:
 
 jobs:
   build:
+    name: Build ${{ matrix.platform }}
     strategy:
       fail-fast: false
       matrix:
@@ -70,7 +71,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev build-essential nsis
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev build-essential nsis nmap unzip
 
       - name: Install Windows NSIS
         if: runner.os == 'Windows'
@@ -100,6 +101,69 @@ jobs:
             echo "Pre-built frontend assets present in desktop/frontend/dist"
           fi
 
+      # -----------------------------------------------------------------------
+      # ZERO-PREREQUISITE BUNDLED ENGINES PREPARATION
+      # -----------------------------------------------------------------------
+      - name: Prepare Windows Bundled Engines
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path desktop/build/bin/tools/nmap
+
+          # Fetch RustScan Windows x86_64
+          Invoke-WebRequest -Uri "https://github.com/bee-san/RustScan/releases/download/2.4.1/x86_64-windows-rustscan.exe.zip" -OutFile "rustscan.zip"
+          7z e rustscan.zip -odesktop/build/bin/tools/ rustscan.exe
+          Remove-Item -Force rustscan.zip
+
+          # Extract Portable Nmap Engine from Official Installer
+          Invoke-WebRequest -Uri "https://nmap.org/dist/nmap-7.95-setup.exe" -OutFile "nmap-setup.exe"
+          7z e nmap-setup.exe -odesktop/build/bin/tools/nmap nmap.exe libcrypto-3.dll libssl-3.dll libssh2.dll zlibwapi.dll nmap-service-probes nmap-services nmap-os-db -r
+          Remove-Item -Force nmap-setup.exe
+
+      - name: Prepare macOS Bundled Engines
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p desktop/build/bin/tools/nmap
+
+          # Fetch and build Universal RustScan binary (Apple Silicon + Intel)
+          curl -sL -O "https://github.com/bee-san/RustScan/releases/download/2.4.1/aarch64-macos-rustscan.tar.gz.zip"
+          curl -sL -O "https://github.com/bee-san/RustScan/releases/download/2.4.1/x86_64-macos-rustscan.tar.gz.zip"
+          unzip -q aarch64-macos-rustscan.tar.gz.zip && tar -xzf aarch64-macos-rustscan.tar.gz && mv rustscan rustscan_arm64
+          unzip -q x86_64-macos-rustscan.tar.gz.zip && tar -xzf x86_64-macos-rustscan.tar.gz && mv rustscan rustscan_x86
+          lipo -create rustscan_arm64 rustscan_x86 -output desktop/build/bin/tools/rustscan
+          chmod +x desktop/build/bin/tools/rustscan
+          rm -f rustscan_arm64 rustscan_x86 *.tar.gz *.zip
+
+          # Fetch Official Nmap Service Probes & Signatures
+          curl -sL -o desktop/build/bin/tools/nmap/nmap-service-probes https://raw.githubusercontent.com/nmap/nmap/master/nmap-service-probes
+          curl -sL -o desktop/build/bin/tools/nmap/nmap-services https://raw.githubusercontent.com/nmap/nmap/master/nmap-services
+
+      - name: Prepare Linux Bundled Engines
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p desktop/build/bin/tools/nmap
+
+          # Fetch Static-PIE Linux RustScan binary
+          curl -sL -O "https://github.com/bee-san/RustScan/releases/download/2.4.1/x86_64-linux-rustscan.tar.gz.zip"
+          unzip -q x86_64-linux-rustscan.tar.gz.zip
+          tar -xzf *.tar.gz
+          cp rustscan desktop/build/bin/tools/
+          rm -rf rustscan *.tar.gz *.zip
+
+          # Copy system Nmap and probe signatures
+          if [ -f "/usr/bin/nmap" ]; then
+            cp /usr/bin/nmap desktop/build/bin/tools/nmap/
+          fi
+          if [ -d "/usr/share/nmap" ]; then
+            cp /usr/share/nmap/nmap-service-probes /usr/share/nmap/nmap-services desktop/build/bin/tools/nmap/ 2>/dev/null || true
+          fi
+          chmod -R 0755 desktop/build/bin/tools
+
+      # -----------------------------------------------------------------------
+      # APPLICATION COMPILATION AND PACKAGING
+      # -----------------------------------------------------------------------
       - name: Build macOS Application (.app & .dmg)
         if: runner.os == 'macOS'
         shell: bash
@@ -141,8 +205,10 @@ jobs:
           path: ${{ matrix.artifact_name }}
 
   release:
+    name: Publish Release
     needs: build
     runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -171,3 +237,5 @@ jobs:
           prerelease: false
           generate_release_notes: true
           files: release_artifacts/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

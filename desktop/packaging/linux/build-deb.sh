@@ -8,11 +8,20 @@ PKG_DIR="pkg_debian"
 rm -rf "${PKG_DIR}"
 mkdir -p "${PKG_DIR}/DEBIAN"
 mkdir -p "${PKG_DIR}/usr/bin"
+mkdir -p "${PKG_DIR}/opt/cerberus/bin"
 mkdir -p "${PKG_DIR}/usr/share/applications"
 mkdir -p "${PKG_DIR}/usr/share/icons/hicolor/512x512/apps"
 
-cp build/bin/cerberus-desktop "${PKG_DIR}/usr/bin/cerberus-desktop"
-chmod 0755 "${PKG_DIR}/usr/bin/cerberus-desktop"
+cp build/bin/cerberus-desktop "${PKG_DIR}/opt/cerberus/bin/cerberus-desktop"
+chmod 0755 "${PKG_DIR}/opt/cerberus/bin/cerberus-desktop"
+ln -sf "/opt/cerberus/bin/cerberus-desktop" "${PKG_DIR}/usr/bin/cerberus-desktop"
+ln -sf "/opt/cerberus/bin/cerberus-desktop" "${PKG_DIR}/usr/bin/cerberus"
+
+if [ -d "build/bin/tools" ]; then
+  echo "==> Bundling portable engines into /opt/cerberus/bin/"
+  cp -R build/bin/tools/* "${PKG_DIR}/opt/cerberus/bin/"
+  chmod -R 0755 "${PKG_DIR}/opt/cerberus/bin"
+fi
 
 if [ -f "packaging/linux/cerberus.desktop" ]; then
   cp packaging/linux/cerberus.desktop "${PKG_DIR}/usr/share/applications/cerberus.desktop"
@@ -44,9 +53,12 @@ EOF
 cat <<'EOF' > "${PKG_DIR}/DEBIAN/postinst"
 #!/bin/sh
 set -e
-if command -v setcap >/dev/null 2>&1 && command -v nmap >/dev/null 2>&1; then
-    NMAP_BIN="$(command -v nmap)"
-    setcap cap_net_raw,cap_net_admin,cap_net_bind_service+eip "$NMAP_BIN" 2>/dev/null || true
+if command -v setcap >/dev/null 2>&1; then
+    for nb in /opt/cerberus/bin/nmap /opt/cerberus/bin/nmap/nmap /usr/bin/nmap; do
+        if [ -f "$nb" ]; then
+            setcap cap_net_raw,cap_net_admin,cap_net_bind_service+eip "$nb" 2>/dev/null || true
+        fi
+    done
 fi
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database -q /usr/share/applications || true
