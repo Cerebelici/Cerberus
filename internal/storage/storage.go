@@ -336,6 +336,9 @@ func (s *Storage) getServicesForDevice(ctx context.Context, deviceID int64, devi
 		svc.DeviceIP = deviceIP
 		services = append(services, svc)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating services for device %d: %w", deviceID, err)
+	}
 	return services, nil
 }
 
@@ -384,6 +387,9 @@ func (s *Storage) getVulnerabilitiesForDevice(ctx context.Context, deviceID int6
 		}
 		vulns = append(vulns, v)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating vulnerabilities: %w", err)
+	}
 	return vulns, nil
 }
 
@@ -408,6 +414,9 @@ func (s *Storage) GetAllServices(ctx context.Context) ([]model.Service, error) {
 			return nil, err
 		}
 		services = append(services, svc)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating all services: %w", err)
 	}
 	return services, nil
 }
@@ -468,6 +477,9 @@ func (s *Storage) GetAllVulnerabilities(ctx context.Context, severity string) ([
 			v.ResolvedAt = &resolvedAt.Time
 		}
 		vulns = append(vulns, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating vulnerabilities: %w", err)
 	}
 	return vulns, nil
 }
@@ -552,6 +564,9 @@ func (s *Storage) GetRecentScans(ctx context.Context, limit int) ([]model.ScanLo
 			return nil, err
 		}
 		logs = append(logs, l)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating scans: %w", err)
 	}
 	return logs, nil
 }
@@ -751,6 +766,9 @@ func (s *Storage) GetTimeline(ctx context.Context, from, to time.Time, statusFil
 		}
 		scanTicks = append(scanTicks, tick)
 	}
+	if err := scanRows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating scan ticks: %w", err)
+	}
 	scanRows.Close()
 	if scanTicks == nil {
 		scanTicks = []model.ScanTick{}
@@ -789,6 +807,9 @@ func (s *Storage) GetTimeline(ctx context.Context, from, to time.Time, statusFil
 		}
 		devList = append(devList, d)
 	}
+	if err := devRows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating devices: %w", err)
+	}
 	devRows.Close()
 
 	// 3. Carry-in records: last record before 'from' for each device
@@ -815,6 +836,9 @@ func (s *Storage) GetTimeline(ctx context.Context, from, to time.Time, statusFil
 		rec.RecordedAt = from
 		carryInByDev[rec.DeviceID] = rec
 	}
+	if err := carryRows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating carry-in records: %w", err)
+	}
 	carryRows.Close()
 
 	// 4. Fetch scan records for these devices inside time window
@@ -837,6 +861,9 @@ func (s *Storage) GetTimeline(ctx context.Context, from, to time.Time, statusFil
 		}
 		rec.IsVulnerable = isVulnInt == 1
 		recordsByDev[rec.DeviceID] = append(recordsByDev[rec.DeviceID], rec)
+	}
+	if err := recRows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating device scan records: %w", err)
 	}
 	recRows.Close()
 
