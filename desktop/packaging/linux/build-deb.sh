@@ -37,14 +37,25 @@ if [ -f "build/appicon.png" ]; then
   chmod 0644 "${PKG_DIR}/usr/share/icons/hicolor/512x512/apps/cerberus.png"
 fi
 
-INSTALLED_SIZE="$(du -sk "${PKG_DIR}/usr" | cut -f1)"
+INSTALLED_SIZE="$(du -sk "${PKG_DIR}" | cut -f1)"
+
+DEB_ARCH="${3:-}"
+if [ -z "${DEB_ARCH}" ]; then
+  DEB_ARCH="$(dpkg --print-architecture 2>/dev/null || true)"
+fi
+if [ -z "${DEB_ARCH}" ]; then
+  case "$(uname -m)" in
+    aarch64|arm64) DEB_ARCH="arm64" ;;
+    *) DEB_ARCH="amd64" ;;
+  esac
+fi
 
 cat <<EOF > "${PKG_DIR}/DEBIAN/control"
 Package: cerberus-sentinel
 Version: ${PLAIN_VERSION}
 Section: net
 Priority: optional
-Architecture: amd64
+Architecture: ${DEB_ARCH}
 Installed-Size: ${INSTALLED_SIZE}
 Depends: nmap, pkexec | policykit-1, libgtk-3-0t64 | libgtk-3-0, libwebkit2gtk-4.1-0 | libwebkit2gtk-4.0-37
 Maintainer: Cerberus Team <security@cerberus.local>

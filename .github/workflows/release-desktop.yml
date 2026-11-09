@@ -30,6 +30,10 @@ jobs:
           - os: ubuntu-24.04
             platform: linux/amd64
             artifact_name: cerberus-sentinel-linux-amd64.deb
+          # Native ARM64 Linux (For your Mac VM / Raspberry Pi / ARM servers)
+          - os: ubuntu-24.04-arm
+            platform: linux/arm64
+            artifact_name: cerberus-sentinel-linux-arm64.deb
           - os: windows-latest
             platform: windows/amd64
             artifact_name: Cerberus-Windows-amd64-installer.exe
@@ -155,12 +159,20 @@ jobs:
         run: |
           mkdir -p desktop/tools/nmap
 
-          # Fetch Static-PIE Linux RustScan binary
-          curl -sL -O "https://github.com/bee-san/RustScan/releases/download/2.4.1/x86_64-linux-rustscan.tar.gz.zip"
-          unzip -q x86_64-linux-rustscan.tar.gz.zip
-          tar -xzf x86_64-linux-rustscan.tar.gz
-          cp rustscan desktop/tools/
-          rm -rf rustscan *.tar.gz *.zip
+          # Fetch architecture-specific RustScan binary
+          ARCH="$(uname -m)"
+          if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+            curl -sL -O "https://github.com/bee-san/RustScan/releases/download/2.4.1/aarch64-linux-rustscan.zip"
+            unzip -q aarch64-linux-rustscan.zip
+            cp rustscan desktop/tools/
+            rm -rf rustscan aarch64-linux-rustscan.zip
+          else
+            curl -sL -O "https://github.com/bee-san/RustScan/releases/download/2.4.1/x86_64-linux-rustscan.tar.gz.zip"
+            unzip -q x86_64-linux-rustscan.tar.gz.zip
+            tar -xzf x86_64-linux-rustscan.tar.gz
+            cp rustscan desktop/tools/
+            rm -rf rustscan *.tar.gz *.zip
+          fi
 
           # Copy system Nmap and probe signatures
           if [ -f "/usr/bin/nmap" ]; then
