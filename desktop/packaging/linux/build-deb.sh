@@ -81,8 +81,29 @@ fi
 exit 0
 EOF
 
+cat <<'EOF' > "${PKG_DIR}/DEBIAN/postrm"
+#!/bin/sh
+set -e
+if [ "$1" = "purge" ]; then
+    if command -v setcap >/dev/null 2>&1 && [ -f "/usr/bin/nmap" ]; then
+        setcap -r /usr/bin/nmap 2>/dev/null || true
+    fi
+    rm -rf /root/.local/share/cerberus
+    for d in /home/*/.local/share/cerberus; do
+        if [ -d "$d" ]; then
+            rm -rf "$d"
+        fi
+    done
+fi
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q /usr/share/applications || true
+fi
+exit 0
+EOF
+
 chmod 0644 "${PKG_DIR}/DEBIAN/control"
 chmod 0755 "${PKG_DIR}/DEBIAN/postinst"
+chmod 0755 "${PKG_DIR}/DEBIAN/postrm"
 find "${PKG_DIR}" -type d -exec chmod 0755 {} +
 
 dpkg-deb -Zxz --root-owner-group --build "${PKG_DIR}" "${OUTPUT_DEB}"

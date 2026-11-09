@@ -114,6 +114,10 @@ SectionEnd
 Section "uninstall"
     !insertmacro wails.setShellContext
 
+    # Purge user databases, scan history, and WebView2 caches
+    RMDir /r "$APPDATA\cerberus"
+    RMDir /r "$LOCALAPPDATA\cerberus"
+    RMDir /r "$LOCALAPPDATA\cerberus-desktop"
     RMDir /r "$AppData\${PRODUCT_EXECUTABLE}" # Remove the WebView2 DataPath
 
     RMDir /r "$INSTDIR\tools"
