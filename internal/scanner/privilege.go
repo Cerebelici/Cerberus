@@ -160,6 +160,7 @@ func SetupPrivilegesOrInstall(ctx context.Context, nmapPath string) error {
 			// Execute powershell Start-Process -Verb runAs
 			psCmd := fmt.Sprintf("Start-Process -FilePath '%s' -ArgumentList '/S' -Verb runAs -Wait", installerPath)
 			cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-Command", psCmd)
+			configureProcessGroup(cmd)
 			out, err := cmd.CombinedOutput()
 			if err != nil {
 				return fmt.Errorf("windows elevated installation failed: %w (output: %s)", err, string(out))
