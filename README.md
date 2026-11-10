@@ -1,266 +1,279 @@
 # Cerberus (Network Sentinel & Endpoint Observability)
 
-Cerberus is an automated cybersecurity intelligence platform combining **active network sweeps** with **Linux kernel-level endpoint observability**. 
+Cerberus is a cross-platform cybersecurity intelligence platform that combines **active
+network sweeps** with **Linux kernel-level endpoint observability**.
 
-It bridges the visibility gap between external network vulnerability scanning and internal runtime behavior:
-- **Cerberus Sentinel (`cerberus`)**: A Go daemon that actively discovers subnet hosts via Nmap, audits open services and CVEs (using `vulners.nse`), tracks host availability lifecycles over a continuous timeline, ingests endpoint telemetry, correlates real-time attack patterns (MITRE ATT&CK), and computes unified fleet posture scores.
-- **Cerberus Agent (`cerberus-agent`)**: A lightweight eBPF security probe written in C (`libbpf` CO-RE) that instruments kernel tracepoints and uprobes to capture process executions, outbound network connections, interactive bash readline commands, memory injections, file tampering, and privilege escalations, streaming batched telemetry to the Sentinel over authenticated HTTP/JSON.
-- **Desktop Packaging**: A standalone Linux desktop application built with Wails v2 that hosts the Go Sentinel daemon in the background while keeping the ingestion port open for remote agents.
+- **Cerberus Sentinel** — a Go daemon that discovers hosts, audits open services and
+  CVEs with nmap and RustScan, tracks device identity over time, ingests endpoint
+  telemetry, runs deterministic detection rules, and computes fleet posture scores.
+- **Cerberus Agent** — a lightweight eBPF probe (separate `cerberus-agent` repository)
+  that streams process, network, shell, injection, and file-tampering events in batches.
+- **Cerberus Desktop** — a Wails v2 app that embeds the daemon and talks to it over
+  Wails IPC. It targets macOS, Windows, and Linux.
+
+The UI does **not** use HTTP. The only HTTP listener is a loopback-only agent ingest
+endpoint (`127.0.0.1:8080`). See [`docs/ipc-api.md`](docs/ipc-api.md) for the desktop
+IPC contract and [`openapi.yaml`](openapi.yaml) for the ingest API.
 
 ---
 
 ## Key Capabilities
 
-- **Automated Network Sweeps & CVE Auditing**: Periodic discovery sweeps (every 30 min) and service vulnerability audits (every 10 min) with instant reactive scanning whenever a new host joins the network.
-- **In-Kernel Endpoint Observability**: Kernel eBPF hooks on process executions, IPv4/IPv6 socket connections, bash commands, `process_vm_writev` memory injections, ptrace, and sensitive file tampering with in-kernel noise filtering.
-- **Real-Time Threat Detection (IRT Engine)**: 10 deterministic security rules mapped to MITRE ATT&CK tactics and techniques, detecting reverse shells, webshells, cross-process injections, fileless executions, and root privilege escalations.
-- **Temporal Activity Timeline**: Segmented device availability and security posture tracking over time (`/api/timeline`) with carry-in state reconstruction and gap-free intervals.
-- **3-Tier Device Identification & Reconciliation**: Recognizes returning devices across dynamic DHCP IP changes and randomized Wi-Fi MAC addresses using digital service keys, per-Wi-Fi MAC persistence, and post-scan service matching.
-- **Fleet Security Posture (`cvss-agg-v1`)**: Deterministic scoring formula aggregating host CVSS scores with active exploit bonuses and deducting penalties for recent live incidents into a unified 0.0–100.0 fleet rating.
+- **One tri-stage scan pipeline** (`HybridEngine`): L2/ARP mapping, fast port
+  discovery through RustScan or nmap, then a targeted nmap service/vulnerability audit
+  against only the ports that are actually open.
+- **Scheduled and reactive scanning**: one full subnet sweep at startup, then a cheap
+  known-device check every 5 minutes; vulnerability audits run every 20 minutes, plus an
+  immediate audit when a new host appears. New hosts between full sweeps are picked up
+  passively from mDNS/SSDP announcements and the kernel neighbour table. All scan work is
+  serialized through one gate so scans never overlap.
+- **Full-port discovery**: an empty `scan_ports` means a full 1-65535 sweep, because IoT
+  and embedded devices routinely listen on non-standard high ports. Ranges, explicit
+  lists, and `--top-ports N` are still supported when explicitly configured.
+- **Endpoint observability**: eBPF hooks for process execution, IPv4/IPv6 connections,
+  interactive shell commands, memory injection, ptrace, and sensitive file writes.
+- **Real-time threat detection**: deterministic rules mapped to MITRE ATT&CK, covering
+  reverse shells, webshells, cross-process injection, fileless execution, and privilege
+  escalation.
+- **Temporal timeline**: device availability and posture periods reconstructed across a
+  time window without gaps.
+- **3-tier device identity**: digital keys (agent ID, SSH host keys, TLS certificates,
+  UPnP/SMB UUIDs), hardware or per-Wi-Fi MAC, then hostname plus service profile.
+- **Fleet posture (`cvss-agg-v1`)**: deterministic 0.0–100.0 rating from CVSS scores,
+  exploit bonuses, and incident penalties.
 
 ---
 
-## How Cerberus Identifies Devices (3-Tier Identity Engine)
+## How Scanning Works
 
-In modern networks, a device's IP address can change whenever it reconnects (via DHCP), and phones or laptops often hide their real hardware MAC address using privacy randomization. To avoid creating duplicate records for the same device, Cerberus identifies devices in **three simple steps** (like checking a passport first, then a visitor badge, and finally a physical description):
+Every discovery and vulnerability scan goes through `internal/scanner.HybridEngine`:
 
-| Tier | Everyday Analogy | What Cerberus Checks | When It Is Used |
-|---|---|---|---|
-| **Tier 1: Digital Passport** | Checking a passport ID number | Permanent digital keys and IDs that never change when IP or MAC changes: `cerberus-agent` ID, SSH server keys (`ssh-hostkey`), HTTPS/SSL certificates (`ssl-cert`), or UPnP/SMB device UUIDs. | Gives **100% certainty** for managed Linux machines, servers, routers, printers, and smart devices—even if both IP and MAC change. |
-| **Tier 2: Hardware & Per-Wi-Fi MAC** | Checking a building visitor badge | Real factory MAC addresses (for wired PCs, servers, IoT) **or** the per-Wi-Fi private MAC address that modern phones and laptops (iOS, Android, Windows, macOS) reuse on the same Wi-Fi network. | Immediately recognizes phones, laptops, and wired devices during the fast discovery scan (`-sn`) whenever the router gives them a **new IP address**. |
-| **Tier 3: Post-Scan Service & Name Match** | Recognizing someone by their name and profile | Local DNS hostname combined with the list of open ports/services discovered after the port scan (`-sV`) finishes. | Catches devices that changed **both** their IP and MAC address at the same time, and automatically merges any temporary discovery record back into the original device. |
+1. **Stage 1 — L2 mapping.** An ARP sweep wakes sleeping devices and refreshes the
+   kernel ARP cache. The platform provider reads the cache natively (sysctl on macOS,
+   netlink on Linux, `GetIpNetTable2` on Windows). These neighbors fill in MAC addresses
+   and add hosts that answer ARP but drop every probed port.
+2. **Stage 2 — Port sweep.** RustScan scans the configured scope (all 65,535 TCP ports
+   by default). If RustScan is unavailable, or the scope is an nmap-only option such as
+   `--top-ports N`, nmap performs the port sweep instead.
+3. **Stage 3 — Deep audit.** nmap runs `-sV` plus the configured vulnerability script
+   only against the ports discovered in Stage 2, then Cerberus stores services,
+   vulnerabilities, and identity observations.
 
-### How the Two-Step Scan Works Together
-1. **Step 1 — Fast Discovery (`RunDiscoveryScan`, `-sn`)**: Cerberus quickly checks which IP addresses are online and resolves their local hostnames. If a device matches **Tier 1** (active agent) or **Tier 2** (same hardware MAC or same per-Wi-Fi private MAC on a new IP), Cerberus immediately links it to the existing device. If the IP and MAC are both completely unfamiliar, Cerberus creates a temporary record and triggers an immediate port scan.
-2. **Step 2 — Deep Service & Key Check (`RunVulnerabilityScan`, `-sV`)**: Cerberus scans the device's open ports, security vulnerabilities, and digital keys (SSH keys, SSL certificates). Once this scan finishes, Cerberus re-checks the device against offline history: if its digital keys (**Tier 1**) or its hostname + open ports (**Tier 3**) match an earlier device, Cerberus automatically merges the temporary record into the original device so all timeline history and alerts stay in one place.
+Discovery uses nmap `-sn` plus the ARP merge. It does not sweep all ports.
 
-### Built-In Safeguards Against Duplicate Devices
-- **Ignoring Ghost Hosts in Unprivileged Mode (`-Pn`)**: When running without raw-socket privileges (`CERBERUS_UNPRIVILEGED=true`), Nmap uses `-Pn`, which reports every scanned IP as "online" even if no device is actually listening there. Cerberus filters out any `-Pn` result that has both zero open ports and no MAC address *before* running identity matching, so inactive or non-responsive IPs never create phantom device records.
-- **Handling Scans Without MAC Addresses**: When Nmap scans across a network where MAC addresses aren't visible (such as unprivileged TCP scans or local container interfaces), Cerberus keeps linking the scan result to the active device holding that IP lease (`IPLease + IPOnlyLease`) rather than creating a new device on every scan. The same applies when a device recorded without a MAC is seen with one for the first time. Empty IP-only records never compete with a device that holds the same IP lease; binding merges them into it.
-- **MAC Addresses from the ARP Table (macOS)**: macOS always scans with unprivileged TCP connect, which cannot read MAC addresses and misses hosts that drop every probed port (phones, many IoT devices). After each sweep, Cerberus reads the ARP entries the OS confirmed during the sweep (`arp -anx`, entries with a running timer only): it fills the MAC of every found host and adds hosts that answered ARP but no TCP probe. Vendors come from the `nmap-mac-prefixes` database installed with nmap.
-- **One Active Device Per IP**: Cerberus deduplicates target IPs before every scan and automatically marks any older device record at the same IP as `down` when a new device takes over that address, preventing duplicate entries from accumulating.
+Between full sweeps, the discovery worker runs a known-device check: it sends one UDP
+datagram per known address to refresh the kernel neighbour cache, falls back to short TCP
+handshakes for routed hosts, and merges mDNS/SSDP announcements from devices that
+advertise themselves. This is deliberately not a DHCP sniff: DHCP snooping requires a
+platform-specific raw capture path and is considered future work. A full sweep also runs
+on manual request and when the target network changes.
+
+### Privileges and platform prerequisites
+
+Privileged execution is **mandatory**. Cerberus never falls back to nmap TCP connect mode
+(`-sT`): a connect scan cannot see filtered ports or the link layer, and silently changes
+the meaning of a result. If the user refuses the elevation prompt, the scanners stay idle
+and the UI reports why.
+
+| Platform | Requirement |
+|---|---|
+| macOS | `nmap` (bundled in the `.app`, or Homebrew), RustScan (bundled), and the `com.cerberus.helper` root helper installed through **SMJobBless**. Installation raises the native macOS authorization prompt, which supports Touch ID, Apple Watch, or the administrator password. The helper binary must live at `Contents/Library/LaunchServices/com.cerberus.helper` with embedded `__info_plist` and `__launchd_plist` sections. The first sweep also triggers the macOS Local Network prompt. |
+| Linux | `nmap` with `cap_net_raw,cap_net_admin,cap_net_bind_service` or root; RustScan is bundled or read from `PATH`. |
+| Windows | Run elevated. The desktop executable uses a `requireAdministrator` manifest, so Windows shows a UAC prompt at launch. **Npcap is required** for raw packet capture; there is no `-sT` fallback. The portable nmap and RustScan binaries are bundled under `tools/`. |
+
+If nmap is missing or below 7.80, startup reports the problem and the UI shows an
+actionable capability warning. Scans do not run until the prerequisite is fixed and the
+process is privileged. The headless daemon can still be run to inspect the database.
+
+**macOS release builds must be signed with a Developer ID.** Local ad-hoc builds use the
+bare `identifier` form and can install the helper for development (the app's
+`CFBundleIdentifier` must match the helper's `SMAuthorizedClients`, and the helper's
+identifier must match the app's `SMPrivilegedExecutables`). Distributed builds need
+`anchor apple generic` in both requirements, with the app and helper signed by the same
+Developer ID identity (`CERBERUS_CODESIGN_IDENTITY`), and the app notarized.
+
+`SMJobBless` has been deprecated since macOS 13 in favor of `SMAppService`. It is still
+present and works, and it remains the development path here. `SMAppService` requires apps
+that contain LaunchDaemons to be notarized, so moving to it is tied to Developer ID
+signing and notarization; Apple also requires an administrator to approve the daemon in
+System Settings. The packaging scripts keep the helper plist and IPC transport ready for
+that migration.
 
 ---
 
-## Deployment & Launch Guides
+## Deployment Modes
 
-Cerberus supports two primary deployment topologies:
+### Desktop (recommended)
 
-```
-[ Deployment Scenarios ]
-1. Distributed VMs + Tailscale-> Overlay mesh VPN connecting Sentinel to remote Linux VMs
-2. Real Physical Network      -> Host LAN sweeps (Wi-Fi/Ethernet) + physical Linux server probes
-```
+The Wails app starts the daemon in-process. The UI receives data through IPC and
+subscribes to log and scan events.
 
----
+### Headless daemon
 
-### Scenario 1: Distributed Setup across VMs using Tailscale
+`cmd/sentinel` runs the same daemon without a UI. It serves only the loopback agent
+ingest listener and logs to stderr (also kept in memory for diagnostics).
 
-Best for multi-node labs, hybrid environments, or cloud VMs across different clouds/VPCs without requiring port forwarding or public IP exposure.
-
-```
-+-----------------------------------------------------------------------------------+
-|                            TAILSCALE OVERLAY NETWORK                              |
-|                                                                                   |
-|  [Sentinel Host / VM]                      [Target VM 1]          [Target VM 2]   |
-|  Tailscale IP: 100.64.0.1                  100.64.0.10            100.64.0.20     |
-|  - Go Sentinel Daemon (:8080)              - cerberus-agent       - cerberus-agent|
-|  - Discovers Tailscale mesh                - eBPF monitoring      - eBPF          |
-|  - Ingests agent telemetry <----------------- HTTPS Batches --------+             |
-+-----------------------------------------------------------------------------------+
-```
-
-#### Step 1: Join Hosts to Tailscale
-Install and authenticate Tailscale on the Sentinel machine and all target Linux VMs:
 ```bash
-sudo tailscale up
-```
-Note the assigned Tailscale IPs (e.g., `100.64.0.1` for Sentinel, `100.64.0.10` for VM 1) or MagicDNS hostnames.
-
-#### Step 2: Start the Sentinel on the Tailscale Interface
-Run the Sentinel configured with a shared enrollment secret and targeting your Tailscale subnet or LAN:
-```bash
-# Set shared enrollment secret and bind to all interfaces (or your tailscale IP)
-export CERBERUS_PORT=8080
-export CERBERUS_HOST=0.0.0.0
-export CERBERUS_ENROLL_TOKEN="cerberus-secret-token"
-export CERBERUS_SUBNET="100.64.0.0/24"  # Sweep specific Tailscale IP range or local subnet
-
+export CERBERUS_SUBNET="192.168.1.0/24"
+export CERBERUS_ENROLL_TOKEN="change-me"
 ./bin/sentinel
 ```
 
-#### Step 3: Install & Start Cerberus Agent on Target VMs
-On each remote Linux VM (Ubuntu, Debian, Fedora with kernel $\ge 5.8$):
+### Agent ingestion
+
+Agent telemetry is accepted only on loopback in this release:
+
 ```bash
-# 1. Clone repository and install eBPF build toolchain
-git clone https://github.com/gr0gu/cerberus-agent.git
-cd cerberus-agent
-sudo ./setup.sh
-
-# 2. Compile kernel bytecode and userspace binary
-make clean && make
-
-# 3. Launch agent pointing to Sentinel's Tailscale IP
-sudo ./proc_exec \
-  --sentinel-url "http://100.64.0.1:8080" \
-  --enroll-token "cerberus-secret-token" \
-  --insecure-http
-```
-*Note: The agent automatically performs initial enrollment, receives a secure bearer token, discovers local network interfaces, and streams eBPF telemetry batches across the encrypted Tailscale tunnel.*
-
----
-
-### Scenario 2: Real Physical Devices in a Real Network (LAN / Wi-Fi)
-
-Best for home labs, office subnets, or dedicated security appliance deployments monitoring physical workstations, IoT devices, printers, and servers.
-
-```
-+-----------------------------------------------------------------------------------+
-|                        PHYSICAL LOCAL NETWORK (192.168.1.0/24)                    |
-|                                                                                   |
-|  [Sentinel Appliance]           [Physical Server]            [Unmanaged Devices]  |
-|  IP: 192.168.1.5                IP: 192.168.1.50             IP: 192.168.1.100+   |
-|  - Sweeps 192.168.1.0/24        - Ubuntu Server              - Smart TVs, Printers|
-|  - Ingestion Listener           - cerberus-agent installed   - Laptops, Phones    |
-|  - Identity Reconciliation <------ Real-time telemetry        - Scanned via Nmap  |
-+-----------------------------------------------------------------------------------+
+export CERBERUS_INGEST_PORT=8080          # default
+export CERBERUS_INGEST_HOST=127.0.0.1     # non-loopback values are refused
+export CERBERUS_ENROLL_TOKEN="change-me"  # enrollment is disabled when empty
 ```
 
-#### Step 1: Prepare Raw Socket Capabilities on Sentinel Host
-To enable fast ARP, ICMP, and OS detection sweeps without running the Sentinel binary as `root`:
-```bash
-# Grant raw packet capture capabilities directly to the Nmap binary
-sudo setcap cap_net_raw,cap_net_admin,cap_net_bind_service+eip $(which nmap)
-```
-*If unprivileged, Cerberus automatically falls back to TCP connect sweeps (`-sT -Pn -PS/PA`).*
-
-#### Step 2: Configure Sentinel for Your Physical Subnet
-Identify your local subnet (e.g., via `ip route | grep default` or `ip addr`) and launch Sentinel:
-```bash
-export CERBERUS_SUBNET="192.168.1.0/24"       # Your local network CIDR
-export CERBERUS_PORT=8080
-export CERBERUS_ENROLL_TOKEN="prod-corp-secret"
-export CERBERUS_UNPRIVILEGED=false            # Uses raw socket capabilities
-
-./bin/sentinel
-```
-*Or launch the desktop UI via `wails dev` or the compiled desktop app.*
-
-#### Step 3: Deploy Agents to Critical Linux Endpoints
-On your physical Linux servers, workstations, or Raspberry Pis:
-```bash
-cd cerberus-agent
-make clean && make
-
-sudo ./proc_exec \
-  --sentinel-url "http://192.168.1.5:8080" \
-  --enroll-token "prod-corp-secret" \
-  --insecure-http \
-  --auto-kill   # Optional: automatically terminates CRITICAL threats locally
-```
-
-#### Step 4: Asset Reconciliation in Action
-- **Unmanaged Devices** (phones, printers, smart TVs): Sentinel tracks them via digital service keys (SSH/TLS/UPnP), per-Wi-Fi MAC persistence, open port profiles, and DHCP lease history.
-- **Managed Endpoints**: The agent self-reports its network interfaces and machine UUID. When Sentinel sweeps the LAN, the Identity Matcher correlates wire observations with internal agent telemetry.
+`POST /api/v1/agent/enroll` issues a bearer token; `POST /api/v1/agent/telemetry`
+accepts batches. Remote/LAN ingestion and the UI that consumes agent telemetry are
+tracked as future work (issues #8 follow-up and #12).
 
 ---
 
 ## Configuration Reference
 
-Key settings can be configured via environment variables:
+Environment variables:
 
 | Variable | Description | Default |
 |---|---|---|
-| `CERBERUS_PORT` | HTTP server port for REST API and agent ingestion | `8080` |
-| `CERBERUS_HOST` | Network interface to bind | `0.0.0.0` |
-| `CERBERUS_DB_PATH` | Path to SQLite database file | `cerberus.db` |
-| `CERBERUS_SUBNET` | Target CIDR to discover (e.g. `192.168.1.0/24`) | `172.28.0.0/24` |
-| `CERBERUS_DISCOVERY_INTERVAL` | Network discovery scan frequency | `30m` |
-| `CERBERUS_VULN_INTERVAL` | Vulnerability audit scan frequency | `10m` |
-| `CERBERUS_ENROLL_TOKEN` | Pre-shared token required for agent enrollment | *Empty* |
-| `CERBERUS_API_KEY` | Operator API key for administrative CRUD operations | *Empty* |
-| `CERBERUS_UNPRIVILEGED` | Force unprivileged TCP connect scan fallback | `true` |
-| `CERBERUS_SCAN_PORTS` | Port range or option for vulnerability audit (e.g. `1-10000`, `21,22,80,3000,6379,8080`, `--top-ports 2000`) | `--top-ports 2000` |
-| `CERBERUS_IMMEDIATE_DELAY` | Cooldown grace period before scanning newly booted hosts | `3s` |
-| `CERBERUS_SCAN_TIMEOUT` | Maximum execution timeout per scan job | `15m` |
+| `CERBERUS_INGEST_PORT` | Loopback agent ingest port | `8080` |
+| `CERBERUS_INGEST_HOST` | Ingest bind address; forced to loopback if not loopback | `127.0.0.1` |
+| `CERBERUS_DISABLE_INGEST` | Disable the agent ingest listener entirely | `false` |
+| `CERBERUS_DB_PATH` | SQLite database path | `cerberus.db` (OS data dir in the desktop app) |
+| `CERBERUS_SUBNET` | Target CIDR; omitted means auto-detect | auto-detect |
+| `CERBERUS_DISCOVERY_INTERVAL` | Known-device check interval after the startup full sweep | `5m` |
+| `CERBERUS_VULN_INTERVAL` | Vulnerability audit interval | `20m` |
+| `CERBERUS_ENROLL_TOKEN` | Shared enrollment secret for agents | *empty (disabled)* |
+| `CERBERUS_SCAN_PORTS` | Port scope: empty (full `1-65535`), `1-10000`, `22,80,443`, or `--top-ports N` | *empty* |
+| `CERBERUS_NMAP_PATH` | Explicit nmap path | `nmap` / bundled |
+| `CERBERUS_VULN_SCRIPT` | nmap NSE script used in Stage 3 | `vulners` |
+| `CERBERUS_SCAN_TIMEOUT` | Maximum duration of one scan job | `15m` |
+| `CERBERUS_IMMEDIATE_DELAY` | Grace period before auditing a newly discovered host | `3s` |
+| `CERBERUS_INGEST_MAX_BODY` | Maximum raw ingest request size | `1048576` |
+| `CERBERUS_INGEST_SHARDS` | Dispatcher shard count | `GOMAXPROCS` |
+| `CERBERUS_EVENT_RETENTION` | Agent event retention | `168h` |
 
----
-
-## REST API Overview
-
-All responses are formatted in JSON:
-
-### Inventory & Device Management
-- `GET /api/devices`: List all tracked devices (filters: `?status=up|down`, `?managed=true|false`, `?min_risk=7.0`).
-- `GET /api/devices/{id}`: Detailed device metadata, open/resolved CVEs, services, and agent status.
-- `PATCH /api/devices/{id}`: Update device label, owner, criticality, or notes.
-- `POST /api/devices/{id}/merge`: Administratively merge two device records.
-- `POST /api/devices/{id}/split`: Split an address lease into an independent record.
-- `GET /api/devices/{id}/identity`: Review deterministic matching rationale and decision audit logs.
-
-### Scans, Settings & Logs
-- `GET /api/status`: Live counters, next scheduled runs and `is_discovery_running` / `is_vuln_running` (queued manual scans and the immediate audit of new hosts count as running).
-- `GET /api/scans?limit=N`: Scan history, newest first. Scans that a previous process left unfinished are recorded as `failed` with an "interrupted" message at startup.
-- `POST /api/scans/discovery/trigger`, `POST /api/scans/vulnerability/trigger`: Queue a manual scan. `202` `{"message","status":"running","scan_type"}` when queued, `409` `{"error","status":"conflict","scan_type"}` when a scan of that type is already running or queued, `503` when no scheduler is available. The desktop IPC methods `TriggerDiscovery` / `TriggerVulnerabilityScan` return the same bodies.
-- `GET /api/settings`, `PUT /api/settings`: Read and change the scan target, ports, intervals and privilege mode. Changes apply at once, without a restart (`PUT` needs loopback or `X-API-Key`).
-- `GET /api/logs`: Recent daemon log lines `{seq, timestamp, level, source, message}`. The desktop app also streams new lines as `cerberus:log` events.
-
-### Vulnerabilities & Timeline
-- `GET /api/services`: List detected network services across all hosts.
-- `GET /api/vulnerabilities`: List detected CVE vulnerabilities (filter: `?severity=CRITICAL`).
-- `GET /api/timeline`: Reconstructed temporal activity periods and scan ticks across a time window (`?from=&to=`).
-
-### Incident Detection & Posture
-- `GET /api/incidents`: Query live security alerts detected by the IRT rule engine.
-- `GET /api/incidents/{id}`: Inspect specific alert with full syscall evidence list.
-- `PATCH /api/incidents/{id}`: Update incident state (`open`, `acknowledged`, `closed`).
-- `GET /api/posture`: Current fleet security rating and individual host risk scores.
-- `GET /api/posture/history`: Historical fleet security rating snapshots.
-
-### Agent Ingestion
-- `POST /api/v1/agent/enroll`: Secure enrollment endpoint issuing agent bearer tokens.
-- `POST /api/v1/agent/telemetry`: High-throughput ingestion endpoint for eBPF event batches.
-- `GET /api/agents`: Enumerate registered endpoint probes and live heartbeat status.
+Saved settings from the desktop Settings page override the interval defaults on the
+next launch. Changing settings applies immediately without a restart and starts a
+discovery sweep of the new target.
 
 ---
 
 ## Building from Source
 
-### Headless Daemon
+### Headless daemon
+
 ```bash
-# Build standalone CGO-free Sentinel binary
 make build-headless
 ```
 
-### Desktop Application (Wails v2)
-Requires the Wails CLI (`go install github.com/wailsapp/wails/v2/cmd/wails@v2.16.0`) and nmap on the machine that runs the app.
+### Desktop app (Wails v2)
 
-macOS: initialize the `front` submodule, then build the universal app and `Cerberus-macOS-universal.dmg` in the repository root:
+Requires the Wails CLI (`go install github.com/wailsapp/wails/v2/cmd/wails@v2.16.0`)
+and the platform toolchain.
+
+macOS — initialize the `front` submodule, then build the universal app and DMG:
+
 ```bash
 git submodule update --init --recursive
 ./build-macos.sh
 ```
-On the first scan, macOS asks whether Cerberus Sentinel may find devices on the local network. Until you allow it, macOS blocks every connection to the LAN; the scan waits up to a minute for the answer and then fails with a message instead of reporting an empty network. You can change the answer later in System Settings > Privacy & Security > Local Network.
 
-Linux (requires `libgtk-3-dev` and `libwebkit2gtk-4.1-dev`):
+Linux — requires `libgtk-3-dev` and `libwebkit2gtk-4.1-dev`:
+
 ```bash
 make build-desktop
 ```
 
-### C/eBPF Agent
-Requires Linux kernel $\ge 5.8$ with BTF support, `clang`, `llvm`, and `libbpf-dev`:
+macOS privileged helper — `build-dmg.sh` builds and injects the helper automatically.
+For a local development build, run:
+
 ```bash
-cd ../cerberus-agent
+cd desktop && wails build
+cd ..
+./scripts/install_helper_dev.sh
+```
+
+The script builds `com.cerberus.helper` with the embedded plists, places it in
+`Contents/Library/LaunchServices/`, signs the app and helper, and launches the app so
+SMJobBless can raise the Touch ID / administrator prompt. Set
+`CERBERUS_CODESIGN_IDENTITY` to a Developer ID identity for a release-like signature.
+
+A Developer ID is **not required for local testing**. The development plists use
+identifier-only requirements, and the app's `CFBundleIdentifier`
+(`io.github.gr0gu.cerberus`) must match the helper's `SMAuthorizedClients`; the helper's
+`CFBundleIdentifier` (`com.cerberus.helper`) must match the app's
+`SMPrivilegedExecutables`. The default ad-hoc signature satisfies both. If SMJobBless
+still refuses an ad-hoc pair, install the helper directly for development:
+
+```bash
+./scripts/install_helper_root_dev.sh
+```
+
+That bypasses the native install prompt and is for development only. A production build
+must tighten both requirements with `and anchor apple generic`, sign the app and helper
+with the same Developer ID, and notarize the app.
+
+Windows — install Npcap on the target machine, then build with the Wails CLI. Release
+CI downloads portable nmap and RustScan into `desktop/tools/`; the resulting
+executable requests administrator privileges at launch.
+
+### Agent
+
+The agent lives in the sibling `cerberus-agent` repository and requires Linux kernel
+5.8+ with BTF, `clang`, `llvm`, and `libbpf-dev`:
+
+```bash
+git clone https://github.com/gr0gu/cerberus-agent.git
+cd cerberus-agent
 sudo ./setup.sh
 make clean && make
 ```
 
-### Testing & Verification
-```bash
-# Run Go unit & integration tests with race detection
-go test -race -count=1 ./...
+### Tests
 
-# Run agent automated verification harness against mock Sentinel
-cd ../cerberus-agent
-python3 tests/mock_sentinel.py --test
+```bash
+go test -race -count=1 ./...
 ```
+
+Automated coverage for the new scan, scheduler, and ingest paths is tracked in
+issue #13.
+
+---
+
+## Project Layout
+
+```
+cmd/sentinel          Headless daemon entrypoint
+cmd/helper            macOS privileged helper
+desktop               Wails app and IPC bridge
+front                 React frontend (git submodule)
+internal/app          Daemon lifecycle and IPC business methods
+internal/scanner      Tri-stage HybridEngine, nmap/RustScan runners, preflight
+internal/scheduler    Periodic workers, serialized scan gate, persistence
+internal/ingest       Loopback agent ingest server and telemetry pipeline
+internal/detect       Detection rules and incident engine
+internal/identity     3-tier identity matcher
+internal/posture      Fleet posture scoring
+internal/storage      SQLite schema, migrations, queries
+docs/ipc-api.md       Desktop IPC contract
+openapi.yaml          Loopback agent ingest API
+```
+
+---
+
+## Known Deferred Work
+
+These are tracked as GitHub issues and are intentionally not part of this release:
+
+- **#11** — harden the local security model (helper peer validation, ingest rate
+  limiting and token rotation, opt-in tracking, file permissions, signing).
+- **#12** — consume agent telemetry in the UI and detection pipeline.
+- **#13** — increase automated test coverage for scanning, scheduling, and ingest.
+
+See the repository issue tracker for the full list.
