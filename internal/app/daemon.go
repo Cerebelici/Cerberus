@@ -4,42 +4,43 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"net"
-	"net/http"
 	"os/exec"
 	"sync"
 	"time"
 
-	"github.com/gr0gu/cerberus/internal/api"
 	"github.com/gr0gu/cerberus/internal/config"
 	"github.com/gr0gu/cerberus/internal/discovery"
+	"github.com/gr0gu/cerberus/internal/ingest"
 	"github.com/gr0gu/cerberus/internal/logstream"
 	"github.com/gr0gu/cerberus/internal/model"
 	"github.com/gr0gu/cerberus/internal/netdetect"
+	"github.com/gr0gu/cerberus/internal/posture"
 	"github.com/gr0gu/cerberus/internal/scanner"
 	"github.com/gr0gu/cerberus/internal/scheduler"
 	"github.com/gr0gu/cerberus/internal/storage"
 	"github.com/gr0gu/cerberus/internal/tracker"
 )
 
-// Daemon manages the unified lifecycle of Cerberus Sentinel workers, storage, and HTTP server.
+// Daemon manages the unified lifecycle of Cerberus Sentinel workers, storage, and the
+// loopback agent ingest listener. The UI talks to it through Wails IPC, not HTTP.
 type Daemon struct {
-	cfg       *config.Config
-	store     *storage.Storage
-	sched     *scheduler.Scheduler
-	scn       *scanner.Scanner
-	srv       *api.Server
-	logs      *logstream.Buffer
-	caps      *model.Capabilities
-	settings  model.AppSettings
-	daemonCtx context.Context
-	cancel    context.CancelFunc
-	stopOnce  sync.Once
-	errCh     chan error
-	ln           net.Listener
+	cfg          *config.Config
+	store        *storage.Storage
+	sched        *scheduler.Scheduler
+	scn          *scanner.Scanner
+	ingest       *ingest.Server
+	posture      *posture.Service
+	logs         *logstream.Buffer
+	caps         *model.Capabilities
+	settings     model.AppSettings
+	daemonCtx    context.Context
+	cancel       context.CancelFunc
+	stopOnce     sync.Once
+	errCh        chan error
 	eventEmitter func(event string, data any)
 	mu           sync.Mutex
 	started      bool
+	startTime    time.Time
 }
 
 // New constructs a new Daemon instance from configuration.
@@ -75,7 +76,7 @@ func (d *Daemon) Logs() []logstream.Entry {
 	return logs.Entries()
 }
 
-// Start boots preflight, storage, scheduler, and optionally the HTTP server.
+// Start boots preflight, storage, scheduler, and the loopback ingest listener.
 func (d *Daemon) Start(ctx context.Context) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -168,7 +169,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 		d.cfg.NetworkCIDR = d.settings.EffectiveCIDR
 	}
 
-	// 4. Initialize scanner, scheduler, and API server
+	// 4. Initialize scanner, scheduler, posture evaluation, and the ingest listener.
 	scn := scanner.New(d.cfg, caps)
 	if d.settings.EffectiveExcludeIP != "" {
 		scn.SetExcludeIPs(d.settings.EffectiveExcludeIP)
@@ -185,48 +186,30 @@ func (d *Daemon) Start(ctx context.Context) error {
 	sched.SetLocalNetworkCheck(func(ctx context.Context) error {
 		return netdetect.WaitForLocalNetworkAccess(ctx, localNetworkWait)
 	})
-	srv := api.NewServer(d.cfg, store, sched, caps)
-	sched.SetPostureService(srv.PostureService())
-	srv.SetLogs(d.logs)
-	srv.SetSettingsProvider(d)
+	postureSvc := posture.NewService(store, posture.DefaultPolicy)
+	sched.SetPostureService(postureSvc)
 
-	// 5. Bind the HTTP listener before any worker starts, so a busy port fails fast instead of
-	// leaving scans (and their nmap processes) running after Start returned an error.
-	var ln net.Listener
-	if !d.cfg.DisableHTTPServer {
-		addr := fmt.Sprintf("%s:%d", d.cfg.ServerHost, d.cfg.ServerPort)
-		ln, err = net.Listen("tcp", addr)
-		if err != nil {
-			_ = store.Close()
-			return fmt.Errorf("binding server address %s: %w", addr, err)
-		}
-	}
-
-	// 6. Establish independent daemon execution context
+	// 5. Establish independent daemon execution context. The scheduler and the ingest
+	// detection pipeline share it, so shutdown stops both.
 	d.daemonCtx, d.cancel = context.WithCancel(context.Background())
 
-	// 7. Start background workers with daemon context
+	ingestSrv := ingest.NewServer(d.daemonCtx, d.cfg, store)
+
+	// 6. Start background workers with the daemon context.
 	sched.Start(d.daemonCtx)
 
-	// 8. Serve HTTP requests only if not explicitly disabled (e.g. desktop IPC mode)
-	if ln != nil {
-		d.ln = ln
-		go func() {
-			if serveErr := srv.Serve(ln); serveErr != nil && serveErr != http.ErrServerClosed {
-				select {
-				case d.errCh <- serveErr:
-				default:
-				}
-			}
-		}()
-		log.Printf("[Daemon] Started Cerberus Sentinel HTTP listener on %s", ln.Addr().String())
-	} else {
-		log.Println("[Daemon] HTTP listener disabled (pure IPC desktop mode)")
+	// 7. Serve agent telemetry on loopback. A busy port must not stop the desktop app.
+	if d.cfg.IngestDisabled {
+		log.Println("[Daemon] Agent ingest listener disabled")
+	} else if err := ingestSrv.Start(); err != nil {
+		log.Printf("[Daemon] Agent ingest listener unavailable: %v", err)
 	}
 
 	d.store = store
 	d.sched = sched
-	d.srv = srv
+	d.ingest = ingestSrv
+	d.posture = postureSvc
+	d.startTime = time.Now().UTC()
 	d.started = true
 
 	return nil
@@ -265,7 +248,7 @@ func (d *Daemon) applyNetworkSettings(s *model.AppSettings) {
 	}
 }
 
-// Stop gracefully stops all background workers, drains the HTTP server, and closes storage.
+// Stop gracefully stops all background workers, drains the ingest listener, and closes storage.
 func (d *Daemon) Stop(ctx context.Context) error {
 	var stopErr error
 	d.stopOnce.Do(func() {
@@ -278,8 +261,8 @@ func (d *Daemon) Stop(ctx context.Context) error {
 			d.sched.Stop()
 		}
 
-		if d.srv != nil {
-			if err := d.srv.Shutdown(ctx); err != nil && err != http.ErrServerClosed {
+		if d.ingest != nil {
+			if err := d.ingest.Shutdown(ctx); err != nil {
 				stopErr = err
 			}
 		}
@@ -303,40 +286,76 @@ func (d *Daemon) Errors() <-chan error {
 // Status returns a live snapshot of the sentinel status.
 func (d *Daemon) Status() model.SystemStatus {
 	d.mu.Lock()
-	srv := d.srv
+	store := d.store
+	sched := d.sched
+	caps := d.caps
+	postureSvc := d.posture
+	ingestSrv := d.ingest
+	startTime := d.startTime
 	d.mu.Unlock()
 
-	if srv != nil {
-		st, err := srv.GetStatus(context.Background())
-		if err == nil {
-			return st
+	if store == nil {
+		return model.SystemStatus{Capabilities: caps}
+	}
+
+	totalDevs, activeDevs, totalSvcs, totalVulns, err := store.GetCounts(context.Background())
+	if err != nil {
+		return model.SystemStatus{Capabilities: caps}
+	}
+
+	uptimeDuration := time.Since(startTime)
+	var discNext, vulnNext *time.Time
+	var discRunning, vulnRunning bool
+	if sched != nil {
+		discNext, vulnNext, discRunning, vulnRunning = sched.GetNextRuns()
+	}
+
+	if caps == nil {
+		caps = &model.Capabilities{
+			NmapPath:      d.cfg.NmapPath,
+			EffectiveMode: "unprivileged",
 		}
 	}
-	return model.SystemStatus{
-		Capabilities: d.caps,
-	}
-}
 
-// ServerAddr returns the network address the daemon is listening on.
-func (d *Daemon) ServerAddr() string {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.ln != nil {
-		return d.ln.Addr().String()
+	status := model.SystemStatus{
+		Uptime:               uptimeDuration.Round(time.Second).String(),
+		UptimeSeconds:        int64(uptimeDuration.Seconds()),
+		TotalDevices:         totalDevs,
+		ActiveDevices:        activeDevs,
+		TotalServices:        totalSvcs,
+		TotalVulnerabilities: totalVulns,
+		DiscoveryNextRun:     discNext,
+		VulnNextRun:          vulnNext,
+		IsDiscoveryRunning:   discRunning,
+		IsVulnRunning:        vulnRunning,
+		Capabilities:         caps,
 	}
-	return fmt.Sprintf("%s:%d", d.cfg.ServerHost, d.cfg.ServerPort)
-}
 
-// Port returns the listening port number, or 0 if not listening.
-func (d *Daemon) Port() int {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.ln != nil {
-		if tcpAddr, ok := d.ln.Addr().(*net.TCPAddr); ok {
-			return tcpAddr.Port
+	if ingestSrv != nil && ingestSrv.Engine() != nil {
+		engine := ingestSrv.Engine()
+		status.IngestEventsTotal = engine.IngestEventsTotal()
+		status.DetectLagMsP95 = engine.DetectLagMsP95()
+		status.IncidentsOpen = engine.OpenIncidentsCount(context.Background())
+	}
+
+	if postureSvc != nil {
+		if report, repErr := postureSvc.Compute(context.Background()); repErr == nil && report != nil {
+			status.FleetScore = report.FleetScore
+			status.PostureStatus = report.PostureStatus
 		}
 	}
-	return d.cfg.ServerPort
+
+	return status
+}
+
+// IngestAddr returns the address of the loopback agent ingest listener.
+func (d *Daemon) IngestAddr() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.ingest != nil {
+		return d.ingest.Addr()
+	}
+	return fmt.Sprintf("%s:%d", d.cfg.IngestHost, d.cfg.IngestPort)
 }
 
 // --- IPC Business Methods ---
@@ -345,7 +364,7 @@ func (d *Daemon) Port() int {
 func (d *Daemon) GetDevices(ctx context.Context, statusFilter string) ([]model.Device, error) {
 	d.mu.Lock()
 	store := d.store
-	srv := d.srv
+	postureSvc := d.posture
 	d.mu.Unlock()
 
 	if store == nil {
@@ -360,8 +379,8 @@ func (d *Daemon) GetDevices(ctx context.Context, statusFilter string) ([]model.D
 		devices = []model.Device{}
 	}
 
-	if srv != nil && srv.PostureService() != nil {
-		report, err := srv.PostureService().Compute(ctx)
+	if postureSvc != nil {
+		report, err := postureSvc.Compute(ctx)
 		if err == nil && report != nil {
 			riskMap := make(map[int64]model.DevicePostureSummary, len(report.DeviceScores))
 			for _, ds := range report.DeviceScores {
@@ -386,7 +405,7 @@ func (d *Daemon) GetDevices(ctx context.Context, statusFilter string) ([]model.D
 func (d *Daemon) GetDeviceByID(ctx context.Context, id int64) (*model.Device, error) {
 	d.mu.Lock()
 	store := d.store
-	srv := d.srv
+	postureSvc := d.posture
 	d.mu.Unlock()
 
 	if store == nil {
@@ -401,8 +420,8 @@ func (d *Daemon) GetDeviceByID(ctx context.Context, id int64) (*model.Device, er
 		return nil, fmt.Errorf("device %d not found", id)
 	}
 
-	if srv != nil && srv.PostureService() != nil {
-		report, err := srv.PostureService().Compute(ctx)
+	if postureSvc != nil {
+		report, err := postureSvc.Compute(ctx)
 		if err == nil && report != nil {
 			for _, ds := range report.DeviceScores {
 				if ds.DeviceID == dev.ID {
@@ -558,33 +577,69 @@ func (d *Daemon) GetScans(ctx context.Context, limit int) ([]model.ScanLog, erro
 	return scans, nil
 }
 
+// ScanRequestResult is the outcome of a manual scan request. It replaces the old HTTP
+// 202/409/503 response: the desktop UI reads the same fields over Wails IPC.
+type ScanRequestResult struct {
+	Status   string `json:"status"` // "running", "conflict", "forbidden", or "unavailable"
+	Message  string `json:"message,omitempty"`
+	Error    string `json:"error,omitempty"`
+	ScanType string `json:"scan_type"`
+}
+
 // RequestScan asks for a manual scan ("discovery" or "vulnerability") without waiting for
-// it. The result matches POST /api/scans/{type}/trigger: 202 accepted, 409 when a scan of
-// that type is already in progress, 503 when the scheduler is not running.
-func (d *Daemon) RequestScan(scanType string) api.ManualScanResult {
+// it. The UI follows progress through Status() and GetScans().
+func (d *Daemon) RequestScan(scanType string) ScanRequestResult {
 	d.mu.Lock()
 	caps := d.caps
 	sched := d.sched
 	d.mu.Unlock()
 
-	if caps != nil && !caps.RawSocket && caps.EffectiveMode != "privileged" {
+	if caps == nil || !caps.RawSocket || caps.EffectiveMode != "privileged" {
 		// Privileged run is mandatory. Prompt elevation if not yet granted.
 		if _, err := d.SetupNmapAndPrivileges(context.Background()); err != nil {
-			return api.ManualScanResult{
-				HTTPStatus: http.StatusForbidden,
-				Body: map[string]string{
-					"error":     "Privileged execution is mandatory. User must accept administrator privileges to perform network scans.",
-					"status":    "forbidden",
-					"scan_type": scanType,
-				},
+			return ScanRequestResult{
+				Status:   "forbidden",
+				Error:    "Privileged execution is mandatory. Grant administrator/root access to perform network scans.",
+				ScanType: scanType,
 			}
 		}
 		d.mu.Lock()
+		caps = d.caps
 		sched = d.sched
 		d.mu.Unlock()
+		if caps == nil || !caps.RawSocket || caps.EffectiveMode != "privileged" {
+			return ScanRequestResult{
+				Status:   "forbidden",
+				Error:    "Privileged execution is mandatory. Grant administrator/root access to perform network scans.",
+				ScanType: scanType,
+			}
+		}
 	}
 
-	return api.RequestManualScan(sched, scanType)
+	if sched == nil {
+		return ScanRequestResult{
+			Status:   "unavailable",
+			Error:    "scan scheduler is not available",
+			ScanType: scanType,
+		}
+	}
+
+	request, message := sched.RequestDiscovery, "Discovery scan initiated in background"
+	if scanType == "vulnerability" {
+		request, message = sched.RequestVulnerabilityScan, "Vulnerability audit initiated in background"
+	}
+	if err := request(); err != nil {
+		return ScanRequestResult{
+			Status:   "conflict",
+			Error:    fmt.Sprintf("A %s scan is already in progress", scanType),
+			ScanType: scanType,
+		}
+	}
+	return ScanRequestResult{
+		Status:   "running",
+		Message:  message,
+		ScanType: scanType,
+	}
 }
 
 // SetScanEventEmitter registers an event handler for streaming scan lifecycle events to Wails/UI.
@@ -611,14 +666,14 @@ func (d *Daemon) CancelScan() bool {
 // GetPosture returns the live fleet posture report.
 func (d *Daemon) GetPosture(ctx context.Context) (*model.PostureReport, error) {
 	d.mu.Lock()
-	srv := d.srv
+	postureSvc := d.posture
 	d.mu.Unlock()
 
-	if srv == nil || srv.PostureService() == nil {
+	if postureSvc == nil {
 		return nil, fmt.Errorf("posture service not available")
 	}
 
-	return srv.PostureService().Compute(ctx)
+	return postureSvc.Compute(ctx)
 }
 
 // GetTimeline returns scan ticks and device periods for frontend timeline rendering.

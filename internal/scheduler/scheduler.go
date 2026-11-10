@@ -23,7 +23,9 @@ import (
 // ErrScanInProgress is returned when a scan of the requested type is already running or queued.
 var ErrScanInProgress = errors.New("scan already in progress")
 
-// Scheduler manages independent concurrent goroutines for network discovery and vulnerability analysis.
+// Scheduler manages independent goroutines for network discovery and vulnerability analysis.
+// Discovery and vulnerability work is serialized through scanGate so only one scan pipeline
+// (nmap/RustScan/raw sockets) runs at a time.
 type Scheduler struct {
 	cfg              *config.Config
 	storage          *storage.Storage
@@ -37,6 +39,9 @@ type Scheduler struct {
 	wg              sync.WaitGroup
 	immediateVulnCh chan string
 	activeTargets   sync.Map // IP -> bool
+	// scanGate is a one-slot semaphore held for the duration of a discovery sweep or a
+	// vulnerability audit. Immediate scans wait for it instead of running concurrently.
+	scanGate chan struct{}
 
 	discoveryRunning atomic.Bool
 	vulnRunning      atomic.Bool
@@ -75,6 +80,7 @@ func New(cfg *config.Config, store *storage.Storage, scn *scanner.Scanner) *Sche
 		manualVulnCh:      make(chan chan error, 5),
 		discoveryResetCh:  make(chan struct{}, 1),
 		vulnResetCh:       make(chan struct{}, 1),
+		scanGate:          make(chan struct{}, 1),
 		discoveryInterval: cfg.DiscoveryInterval,
 		vulnInterval:      cfg.VulnerabilityInterval,
 	}
@@ -149,8 +155,9 @@ func (s *Scheduler) EnqueueImmediateScan(ip string) {
 }
 
 // Start boots the background goroutines:
-// 1. Discovery Worker (cron: 30 minutes)
-// 2. Periodic Vulnerability Worker (cron: 10 minutes)
+// 1. Discovery Worker: one full sweep at startup, then cheap known-device checks
+// (configured interval, default 5 minutes)
+// 2. Periodic Vulnerability Worker (configured interval, default 20 minutes)
 // 3. Immediate Reactive Vulnerability Worker (event-driven queue)
 // 4. Daily Retention Worker (90-day retention)
 // 5. Hourly Posture Snapshot Worker
@@ -159,6 +166,10 @@ func (s *Scheduler) Start(ctx context.Context) {
 	discEvery, vulnEvery := s.Intervals()
 	log.Printf("[Scheduler] Starting background engines (Discovery: %v, Vulnerability: %v)",
 		discEvery, vulnEvery)
+	if !s.scanner.CanScan() {
+		log.Println("[Scheduler] WARNING: privileged execution is not available; scans stay idle until the user grants administrator/root rights")
+	}
+	s.discoveryService.StartPassive(ctx)
 
 	s.wg.Add(6)
 	go s.runDiscoveryWorker(ctx)
@@ -176,7 +187,7 @@ func (s *Scheduler) Stop() {
 }
 
 // -------------------------------------------------------------
-// Goroutine 1: Network Discovery (Every 30 Minutes + Manual)
+// Goroutine 1: Network Discovery (Configured Interval + Manual)
 // -------------------------------------------------------------
 func (s *Scheduler) runDiscoveryWorker(ctx context.Context) {
 	defer s.wg.Done()
@@ -185,7 +196,8 @@ func (s *Scheduler) runDiscoveryWorker(ctx context.Context) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	// Perform initial discovery scan immediately on startup
+	// The first run is a full subnet sweep. Later ticks only refresh known devices and
+	// listen for passive announcements, so the network is not woken every five minutes.
 	s.setNextDiscoveryRun(time.Now().Add(interval))
 	s.executeDiscovery(ctx)
 
@@ -202,7 +214,7 @@ func (s *Scheduler) runDiscoveryWorker(ctx context.Context) {
 
 		case <-ticker.C:
 			s.setNextDiscoveryRun(time.Now().Add(interval))
-			s.executeDiscovery(ctx)
+			s.executeKnownDeviceCheck(ctx)
 
 		case respCh := <-s.manualDiscoveryCh:
 			err := s.executeDiscovery(ctx)
@@ -247,12 +259,47 @@ func (s *Scheduler) setActiveCancel(cancel context.CancelFunc) {
 	s.activeScanCancel = cancel
 }
 
+// acquireScanGate waits until no other scan pipeline is running. The wait is cancelled
+// when ctx ends, so shutdown does not leave a queued worker stuck.
+func (s *Scheduler) acquireScanGate(ctx context.Context) error {
+	select {
+	case s.scanGate <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Scheduler) releaseScanGate() {
+	<-s.scanGate
+}
+
+// executeDiscovery runs a full subnet sweep. It is used at startup and for manual
+// requests, but not for the recurring five-minute tick.
 func (s *Scheduler) executeDiscovery(ctx context.Context) error {
+	return s.executeDiscoveryMode(ctx, true)
+}
+
+// executeKnownDeviceCheck refreshes known devices and harvests passive announcements.
+func (s *Scheduler) executeKnownDeviceCheck(ctx context.Context) error {
+	return s.executeDiscoveryMode(ctx, false)
+}
+
+func (s *Scheduler) executeDiscoveryMode(ctx context.Context, fullSweep bool) error {
+	if !s.scanner.CanScan() {
+		log.Println("[Discovery Worker] Skipping scan: privileged execution is required")
+		return scanner.ErrPrivilegedRequired
+	}
 	if !s.discoveryRunning.CompareAndSwap(false, true) {
 		log.Println("[Discovery Worker] Scan already in progress, skipping.")
 		return fmt.Errorf("discovery scan already in progress")
 	}
 	defer s.discoveryRunning.Store(false)
+
+	if err := s.acquireScanGate(ctx); err != nil {
+		return err
+	}
+	defer s.releaseScanGate()
 
 	scanCtx, cancel := context.WithCancel(ctx)
 	s.setActiveCancel(cancel)
@@ -262,7 +309,13 @@ func (s *Scheduler) executeDiscovery(ctx context.Context) error {
 	}()
 
 	s.EmitEvent("scan:stage_changed", "Stage 1: L2 Mapping")
-	devices, err := s.discoveryService.Run(scanCtx)
+	var devices []model.Device
+	var err error
+	if fullSweep {
+		devices, err = s.discoveryService.Run(scanCtx)
+	} else {
+		devices, err = s.discoveryService.RunKnownDeviceCheck(scanCtx)
+	}
 	if err == nil {
 		for _, d := range devices {
 			s.EmitEvent("scan:host_discovered", map[string]string{
@@ -286,7 +339,7 @@ func (s *Scheduler) executeDiscovery(ctx context.Context) error {
 }
 
 // -------------------------------------------------------------
-// Goroutine 2: Periodic Vulnerability Audit (Every 10 Minutes + Manual)
+// Goroutine 2: Periodic Vulnerability Audit (Configured Interval + Manual)
 // -------------------------------------------------------------
 func (s *Scheduler) runPeriodicVulnWorker(ctx context.Context) {
 	defer s.wg.Done()
@@ -409,6 +462,15 @@ func (s *Scheduler) scanTargets(ctx context.Context, targets []string, scanType 
 	if len(targets) == 0 {
 		return nil
 	}
+
+	if !s.scanner.CanScan() {
+		return scanner.ErrPrivilegedRequired
+	}
+
+	if err := s.acquireScanGate(ctx); err != nil {
+		return err
+	}
+	defer s.releaseScanGate()
 
 	start := time.Now()
 	targetSpec := strings.Join(targets, ", ")

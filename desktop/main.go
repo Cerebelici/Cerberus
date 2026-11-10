@@ -32,8 +32,8 @@ func main() {
 	if cfg.DBPath == "cerberus.db" {
 		cfg.DBPath = config.OSDataDir("cerberus", "cerberus.db")
 	}
-	// Desktop runs in pure IPC mode without starting the HTTP server
-	cfg.DisableHTTPServer = true
+	// Desktop talks to the daemon over Wails IPC. The only HTTP listener is the loopback
+	// agent ingest endpoint, which stays on 127.0.0.1 unless explicitly disabled.
 
 	d := app.New(cfg)
 	d.SetLogs(logs)

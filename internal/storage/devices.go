@@ -424,6 +424,11 @@ func (s *Storage) MarkMissingDevicesDown(ctx context.Context, scanID int64, obse
 				}
 			}
 
+			// scanID 0 is a lightweight known-device check: it updates device state but
+			// does not write a timeline record for every five-minute tick.
+			if scanID <= 0 {
+				continue
+			}
 			insertRecord := `INSERT INTO device_scan_records (device_id, scan_id, status, is_vulnerable, vulns_count, max_severity, recorded_at)
 				VALUES (?, ?, 'down', 0, 0, 'NONE', ?);`
 			if _, err := tx.tx.ExecContext(ctx, insertRecord, dev.id, scanID, scanTime); err != nil {

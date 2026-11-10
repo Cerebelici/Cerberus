@@ -10,8 +10,10 @@ import (
 
 // Config holds all runtime configuration for Cerberus Sentinel.
 type Config struct {
-	ServerHost            string
-	ServerPort            int
+	// IngestHost and IngestPort configure the loopback-only agent telemetry listener.
+	IngestHost            string
+	IngestPort            int
+	IngestDisabled        bool
 	DBPath                string
 	NetworkCIDR           string
 	DiscoveryInterval     time.Duration
@@ -23,10 +25,8 @@ type Config struct {
 	IngestMaxBody         int64
 	IngestShards          int
 	EventRetention        time.Duration
-	APIKey                string
 	ScanPorts             string
 	ImmediateScanDelay    time.Duration
-	DisableHTTPServer     bool
 	AutoDetectNetwork     bool
 
 	ActiveUsersHost  string
@@ -79,12 +79,13 @@ func Load() *Config {
 	autoDetect := !hasSubnet
 
 	cfg := &Config{
-		ServerHost:            getEnv("CERBERUS_HOST", "0.0.0.0"),
-		ServerPort:            getEnvInt("CERBERUS_PORT", 8080),
+		IngestHost:            getEnv("CERBERUS_INGEST_HOST", "127.0.0.1"),
+		IngestPort:            getEnvInt("CERBERUS_INGEST_PORT", 8080),
+		IngestDisabled:        getEnvBool("CERBERUS_DISABLE_INGEST", false),
 		DBPath:                getEnv("CERBERUS_DB_PATH", "cerberus.db"),
 		NetworkCIDR:           subnetEnv,
 		DiscoveryInterval:     getEnvDuration("CERBERUS_DISCOVERY_INTERVAL", 5*time.Minute),
-		VulnerabilityInterval: getEnvDuration("CERBERUS_VULN_INTERVAL", 5*time.Minute),
+		VulnerabilityInterval: getEnvDuration("CERBERUS_VULN_INTERVAL", 20*time.Minute),
 		NmapPath:              getEnv("CERBERUS_NMAP_PATH", "nmap"),
 		VulnScript:            getEnv("CERBERUS_VULN_SCRIPT", "vulners"),
 		ScanTimeout:           getEnvDuration("CERBERUS_SCAN_TIMEOUT", 15*time.Minute),
@@ -92,10 +93,8 @@ func Load() *Config {
 		IngestMaxBody:         getEnvInt64("CERBERUS_INGEST_MAX_BODY", 1048576),
 		IngestShards:          getEnvInt("CERBERUS_INGEST_SHARDS", runtime.GOMAXPROCS(0)),
 		EventRetention:        getEnvDuration("CERBERUS_EVENT_RETENTION", 168*time.Hour),
-		APIKey:                getEnv("CERBERUS_API_KEY", ""),
 		ScanPorts:             getEnv("CERBERUS_SCAN_PORTS", ""),
 		ImmediateScanDelay:    getEnvDuration("CERBERUS_IMMEDIATE_DELAY", 3*time.Second),
-		DisableHTTPServer:     getEnvBool("CERBERUS_DISABLE_HTTP", false),
 		AutoDetectNetwork:     autoDetect,
 
 		ActiveUsersHost:  getEnv("ACTIVE_USERS_HOST_ENDPOINT", ""),

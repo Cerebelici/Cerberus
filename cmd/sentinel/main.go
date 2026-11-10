@@ -25,7 +25,7 @@ const banner = `
 `
 
 func main() {
-	// Keep the daemon log in memory for GET /api/logs, and still write it to stderr.
+	// Keep the daemon log in memory for diagnostics, and still write it to stderr.
 	logs := logstream.New(2000)
 	log.SetOutput(io.MultiWriter(os.Stderr, logs))
 
@@ -33,14 +33,15 @@ func main() {
 	log.Println("[Main] Initializing Cerberus Network Sentinel...")
 
 	cfg := config.Load()
-	log.Printf("[Main] Config: Subnet=%s, DiscoveryInterval=%v, VulnInterval=%v, Port=%d, DB=%s",
-		cfg.NetworkCIDR, cfg.DiscoveryInterval, cfg.VulnerabilityInterval, cfg.ServerPort, cfg.DBPath)
+	log.Printf("[Main] Config: Subnet=%s, DiscoveryInterval=%v, VulnInterval=%v, Ingest=%s:%d, DB=%s",
+		cfg.NetworkCIDR, cfg.DiscoveryInterval, cfg.VulnerabilityInterval, cfg.IngestHost, cfg.IngestPort, cfg.DBPath)
 
 	d := app.New(cfg)
 	d.SetLogs(logs)
 	if err := d.Start(context.Background()); err != nil {
 		log.Fatalf("[Main] Failed to start Cerberus daemon: %v", err)
 	}
+	log.Printf("[Main] Agent telemetry endpoint: http://%s", d.IngestAddr())
 
 	stopCh := make(chan os.Signal, 1)
 	signal.Notify(stopCh, os.Interrupt, syscall.SIGTERM)

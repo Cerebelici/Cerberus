@@ -2,10 +2,7 @@ package main
 
 import (
 	"context"
-	"errors"
-	"net/http"
 
-	"github.com/gr0gu/cerberus/internal/api"
 	"github.com/gr0gu/cerberus/internal/app"
 	"github.com/gr0gu/cerberus/internal/model"
 )
@@ -49,7 +46,7 @@ func (b *Bridge) GetTimeline(from, to, status string, vulnerableOnly bool) (*mod
 	return b.d.GetTimeline(ctx, from, to, status, vulnerableOnly)
 }
 
-// GetDevices returns all tracked devices, with optional ?status=up|down filter.
+// GetDevices returns all tracked devices, with an optional "up"/"down" status filter.
 func (b *Bridge) GetDevices(status string) (map[string]any, error) {
 	ctx := b.ctx
 	if ctx == nil {
@@ -199,16 +196,14 @@ func (b *Bridge) GetScans(limit int) (map[string]any, error) {
 }
 
 // TriggerDiscovery initiates an immediate host discovery sweep.
-// The result has the same body as POST /api/scans/discovery/trigger; a scan that is already
-// in progress gives status "conflict" (HTTP 409) instead of an error.
+// A scan of the same type that is already running reports status "conflict".
 func (b *Bridge) TriggerDiscovery() (map[string]string, error) {
-	return b.requestScan(api.ScanTypeDiscovery)
+	return b.requestScan("discovery")
 }
 
 // TriggerVulnerabilityScan initiates an immediate vulnerability audit.
-// The result has the same body as POST /api/scans/vulnerability/trigger.
 func (b *Bridge) TriggerVulnerabilityScan() (map[string]string, error) {
-	return b.requestScan(api.ScanTypeVulnerability)
+	return b.requestScan("vulnerability")
 }
 
 // CancelScan terminates the active network scan immediately without orphan processes.
@@ -221,10 +216,17 @@ func (b *Bridge) CancelScan() (map[string]string, error) {
 
 func (b *Bridge) requestScan(scanType string) (map[string]string, error) {
 	result := b.d.RequestScan(scanType)
-	if result.HTTPStatus >= http.StatusInternalServerError {
-		return nil, errors.New(result.Body["error"])
+	body := map[string]string{
+		"status":    result.Status,
+		"scan_type": result.ScanType,
 	}
-	return result.Body, nil
+	if result.Message != "" {
+		body["message"] = result.Message
+	}
+	if result.Error != "" {
+		body["error"] = result.Error
+	}
+	return body, nil
 }
 
 // GetLogs returns the recent lines of the daemon log, oldest first. New lines are sent
