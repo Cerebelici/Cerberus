@@ -127,28 +127,39 @@ func (p *DarwinPlatform) GetKernelARPCache() ([]HostARPEntry, error) {
 		return p.fallbackKernelARPCache()
 	}
 
-	lim := uintptr(unsafe.Pointer(&buf[0])) + uintptr(needed)
-	next := uintptr(unsafe.Pointer(&buf[0]))
-
-	for next < lim {
-		rtm := (*C.struct_rt_msghdr)(unsafe.Pointer(next))
-		if rtm.rtm_msglen == 0 {
+	// Walk the routing messages by offset into buf instead of converting uintptr
+	// addresses back to pointers, which would hide the buffer from the garbage
+	// collector and trip the unsafe.Pointer checks.
+	offset := uintptr(0)
+	bufLen := uintptr(len(buf))
+	for offset+unsafe.Sizeof(C.struct_rt_msghdr{}) <= bufLen {
+		rtm := (*C.struct_rt_msghdr)(unsafe.Pointer(&buf[offset]))
+		msgLen := uintptr(rtm.rtm_msglen)
+		if msgLen == 0 || offset+msgLen > bufLen {
 			break
 		}
 
-		sin := (*C.struct_sockaddr_in)(unsafe.Pointer(next + unsafe.Sizeof(*rtm)))
+		sinOff := offset + unsafe.Sizeof(*rtm)
+		if sinOff+unsafe.Sizeof(C.struct_sockaddr_in{}) > bufLen {
+			break
+		}
+		sin := (*C.struct_sockaddr_in)(unsafe.Pointer(&buf[sinOff]))
 		sinLen := uintptr(sin.sin_len)
 		if sinLen == 0 {
 			sinLen = unsafe.Sizeof(C.struct_sockaddr_in{})
 		}
 
-		sdl := (*C.struct_sockaddr_dl)(unsafe.Pointer(uintptr(unsafe.Pointer(sin)) + sinLen))
+		sdlOff := sinOff + sinLen
+		if sdlOff+unsafe.Sizeof(C.struct_sockaddr_dl{}) > bufLen {
+			break
+		}
+		sdl := (*C.struct_sockaddr_dl)(unsafe.Pointer(&buf[sdlOff]))
 
 		if sdl.sdl_alen == 6 {
 			ipBytes := (*[4]byte)(unsafe.Pointer(&sin.sin_addr.s_addr))
 			ip := net.IPv4(ipBytes[0], ipBytes[1], ipBytes[2], ipBytes[3])
 
-			macPtr := unsafe.Pointer(uintptr(unsafe.Pointer(&sdl.sdl_data[0])) + uintptr(sdl.sdl_nlen))
+			macPtr := unsafe.Add(unsafe.Pointer(&sdl.sdl_data[0]), uintptr(sdl.sdl_nlen))
 			macSlice := C.GoBytes(macPtr, 6)
 			mac := net.HardwareAddr(macSlice)
 
@@ -163,7 +174,7 @@ func (p *DarwinPlatform) GetKernelARPCache() ([]HostARPEntry, error) {
 			})
 		}
 
-		next += uintptr(rtm.rtm_msglen)
+		offset += msgLen
 	}
 
 	if len(entries) == 0 {
@@ -282,7 +293,7 @@ func addrCallback(ref unsafe.Pointer, flags uint32, ifIndex uint32, errorCode in
 		ipStr := net.IPv4(ipBytes[0], ipBytes[1], ipBytes[2], ipBytes[3]).String()
 
 		bonjourMu.Lock()
-		bCtx, ok := activeResolvers[uintptr(ctx)]
+		bCtx, ok := activeResolvers[*(*uintptr)(ctx)]
 		if ok && bCtx != nil {
 			name := strings.TrimSuffix(C.GoString(hostname), ".")
 			bCtx.results[ipStr] = name
@@ -302,6 +313,15 @@ func (p *DarwinPlatform) ResolveBonjourServices(timeout time.Duration) (map[stri
 		"_http._tcp",
 	}
 
+	// The DNS-SD callback receives its context as an opaque void* and must not receive a
+	// Go pointer, because the pointer outlives the call that passes it. Store the lookup
+	// key in C memory and free it once every browse/poll call has finished.
+	idMem := C.malloc(C.size_t(unsafe.Sizeof(uintptr(0))))
+	if idMem == nil {
+		return nil, fmt.Errorf("allocating Bonjour resolver context")
+	}
+	defer C.free(idMem)
+
 	bonjourMu.Lock()
 	resolverCounter++
 	id := resolverCounter
@@ -310,6 +330,7 @@ func (p *DarwinPlatform) ResolveBonjourServices(timeout time.Duration) (map[stri
 	}
 	activeResolvers[id] = bCtx
 	bonjourMu.Unlock()
+	*(*uintptr)(idMem) = id
 
 	defer func() {
 		bonjourMu.Lock()
@@ -324,7 +345,7 @@ func (p *DarwinPlatform) ResolveBonjourServices(timeout time.Duration) (map[stri
 		}
 		var browseRef C.DNSServiceRef
 		cType := C.CString(st)
-		err := C.cerberus_start_browse(&browseRef, cType, unsafe.Pointer(id))
+		err := C.cerberus_start_browse(&browseRef, cType, idMem)
 		C.free(unsafe.Pointer(cType))
 
 		if err == 0 {

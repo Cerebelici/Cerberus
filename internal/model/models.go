@@ -55,17 +55,17 @@ type IdentityDecision struct {
 	Reason           string    `json:"reason"`
 }
 
-// MergeDeviceRequest parameters for POST /api/devices/{id}/merge.
+// MergeDeviceRequest describes an administrative device merge (storage layer).
 type MergeDeviceRequest struct {
 	SourceID int64 `json:"source_id"`
 }
 
-// SplitDeviceRequest parameters for POST /api/devices/{id}/split.
+// SplitDeviceRequest describes splitting an address lease into a device record (storage layer).
 type SplitDeviceRequest struct {
 	AddressID int64 `json:"address_id"`
 }
 
-// UpdateDeviceRequest parameters for PATCH /api/devices/{id}.
+// UpdateDeviceRequest carries editable device fields exposed through the IPC bridge.
 type UpdateDeviceRequest struct {
 	Label       *string `json:"label,omitempty"`
 	Criticality *string `json:"criticality,omitempty"`
@@ -263,7 +263,7 @@ type TimelineTimeWindow struct {
 	TotalDevices int       `json:"total_devices"`
 }
 
-// TimelineResponse is the complete payload returned by GET /api/timeline.
+// TimelineResponse is the complete payload returned by the GetTimeline IPC method.
 type TimelineResponse struct {
 	TimeWindow TimelineTimeWindow `json:"time_window"`
 	ScanTicks  []ScanTick         `json:"scan_ticks"`
@@ -286,7 +286,7 @@ type AppSettings struct {
 	CustomNetworkCIDR    string `json:"custom_network_cidr"`    // e.g. "192.168.1.0/24"
 	EffectiveCIDR        string `json:"effective_cidr"`         // Target CIDR currently being scanned
 	EffectiveExcludeIP   string `json:"effective_exclude_ip"`   // Host IP excluded from scan
-	ScanPorts            string `json:"scan_ports"`             // "" (Top 1000), "1-65535", or custom "22,80,443"
+	ScanPorts            string `json:"scan_ports"`             // "" (full 1-65535), a range, or custom "22,80,443"
 	DiscoveryIntervalSec int    `json:"discovery_interval_sec"` // Interval between discovery scans in seconds
 	VulnIntervalSec      int    `json:"vuln_interval_sec"`      // Interval between vuln scans in seconds
 	NmapPath             string `json:"nmap_path"`              // Detected or user-overridden Nmap path

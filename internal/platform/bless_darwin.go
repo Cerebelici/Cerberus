@@ -57,14 +57,27 @@ import "C"
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"unsafe"
 )
 
-// BlessPrivilegedHelper initiates native macOS Touch ID / PIN prompt via SMJobBless
-// to install and activate com.cerberus.helper root daemon.
+// BlessPrivilegedHelper initiates the native macOS authorization prompt via SMJobBless
+// to install and activate com.cerberus.helper. The prompt is the system-managed
+// Touch ID / Apple Watch / administrator-password dialog.
 func BlessPrivilegedHelper(helperID string) error {
 	if helperID == "" {
 		helperID = "com.cerberus.helper"
+	}
+
+	// SMJobBless resolves the helper from the calling app's bundle, so fail with an
+	// actionable message instead of an opaque launchd error when it is missing.
+	if exe, err := os.Executable(); err == nil {
+		contents := filepath.Dir(filepath.Dir(exe)) // .../Cerberus.app/Contents
+		helperPath := filepath.Join(contents, "Library", "LaunchServices", helperID)
+		if _, statErr := os.Stat(helperPath); statErr != nil {
+			return fmt.Errorf("SMJobBless helper missing at %s: build it with scripts/build_helper_macos.sh and place it in Contents/Library/LaunchServices", helperPath)
+		}
 	}
 
 	cHelper := C.CString(helperID)

@@ -89,13 +89,25 @@ func Preflight(ctx context.Context, cfg *config.Config, r CommandRunner, look fu
 		caps.Warnings = append(caps.Warnings, fmt.Sprintf("vulnerability script %q unavailable or failed to initialize", vulnScript))
 	}
 
-	// Check raw socket privileges
+	// Check raw socket privileges. Privileged execution is mandatory: there is no TCP
+	// connect (-sT) fallback, because a connect scan misses filtered ports, cannot see the
+	// link layer, and silently degrades results.
 	rawSocket := false
-	if os.Geteuid() == 0 {
+	elevated := processIsElevated()
+	switch {
+	case runtime.GOOS == "windows":
+		// Windows needs both an elevated token and Npcap for raw/SYN scans.
+		rawSocket = elevated && hasNpcap()
+		if !elevated {
+			caps.Warnings = append(caps.Warnings, "process is not elevated; restart Cerberus as Administrator to allow network scans")
+		} else if !hasNpcap() {
+			caps.Warnings = append(caps.Warnings, "Npcap is not installed; raw packet capture is required for scans. Install Npcap and restart Cerberus.")
+		}
+	case elevated:
 		rawSocket = true
-	} else if runtime.GOOS == "darwin" {
-		// On macOS, desktop capture uses /dev/bpf* packet filter devices or the certified privileged root helper.
-		// When helper is active, or /dev/bpf* is readable/writable, macOS operates in privileged mode.
+	case runtime.GOOS == "darwin":
+		// On macOS, packet capture uses /dev/bpf* packet filter devices or the
+		// SMJobBless-installed privileged root helper.
 		helper := platform.NewHelperClient()
 		if helper.IsHelperAvailable() {
 			rawSocket = true
@@ -104,7 +116,7 @@ func Preflight(ctx context.Context, cfg *config.Config, r CommandRunner, look fu
 		} else if IsSetuidRoot(resolvedPath) {
 			rawSocket = true
 		}
-	} else {
+	default:
 		getcapPath, getcapLookErr := look("getcap")
 		if getcapLookErr == nil && getcapPath != "" {
 			if capOut, capErr := r.Run(ctx, getcapPath, resolvedPath); capErr == nil {
@@ -125,7 +137,6 @@ func Preflight(ctx context.Context, cfg *config.Config, r CommandRunner, look fu
 	}
 	caps.RawSocket = rawSocket
 
-	// EffectiveMode requires raw socket / privileged capabilities. Privileged run is mandatory.
 	if rawSocket {
 		caps.EffectiveMode = "privileged"
 	} else {

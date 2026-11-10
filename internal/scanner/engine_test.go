@@ -109,6 +109,63 @@ func (m *mockRunner) Run(ctx context.Context, name string, args ...string) ([]by
 	return []byte(xml), nil
 }
 
+func TestStage2RustScanDefaultsToFullRange(t *testing.T) {
+	runner := &mockRunner{}
+	_, err := Stage2RustScanWithRunner(context.Background(), runner, []string{"192.168.1.50"}, &RustScanConfig{
+		Binary: "rustscan",
+	})
+	if err != nil {
+		t.Fatalf("Stage2RustScanWithRunner failed: %v", err)
+	}
+	found := false
+	for i, arg := range runner.lastArgs {
+		if arg == "--range" && i+1 < len(runner.lastArgs) && runner.lastArgs[i+1] == "1-65535" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected full port range --range 1-65535, got %v", runner.lastArgs)
+	}
+	for _, arg := range runner.lastArgs {
+		if arg == "--top" {
+			t.Fatalf("RustScan must not fall back to top-1,000 ports, got %v", runner.lastArgs)
+		}
+	}
+	ulimitFound := false
+	for i, arg := range runner.lastArgs {
+		if arg == "--ulimit" && i+1 < len(runner.lastArgs) && runner.lastArgs[i+1] == "65535" {
+			ulimitFound = true
+			break
+		}
+	}
+	if !ulimitFound {
+		t.Fatalf("expected --ulimit 65535 so batch sockets are not serialised, got %v", runner.lastArgs)
+	}
+}
+
+func TestPortSpecArgsDefaultsToFullRange(t *testing.T) {
+	got := portSpecArgs("")
+	if len(got) != 2 || got[0] != "-p" || got[1] != "1-65535" {
+		t.Fatalf("expected -p 1-65535, got %v", got)
+	}
+}
+
+func TestStage3NmapAuditNeverUsesConnectScan(t *testing.T) {
+	runner := &mockRunner{}
+	targets := []Stage3Target{
+		{IP: "192.168.1.50", MAC: "AA:BB:CC:DD:EE:FF", OpenPorts: []int{80}},
+	}
+	if _, err := Stage3NmapAudit(context.Background(), runner, "nmap", "vulners", targets); err != nil {
+		t.Fatalf("Stage3NmapAudit failed: %v", err)
+	}
+	for _, arg := range runner.lastArgs {
+		if arg == "-sT" {
+			t.Fatalf("scan must not use the -sT fallback, got %v", runner.lastArgs)
+		}
+	}
+}
+
 func TestStage3NmapAuditZeroPorts(t *testing.T) {
 	runner := &mockRunner{}
 	targets := []Stage3Target{

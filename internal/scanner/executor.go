@@ -5,19 +5,21 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"net/netip"
 	"os"
 	"os/exec"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/gr0gu/cerberus/internal/config"
 	"github.com/gr0gu/cerberus/internal/model"
 	"github.com/gr0gu/cerberus/internal/platform"
 )
+
+// ErrPrivilegedRequired is returned when a scan is requested without the raw-socket
+// privileges the application mandates. There is no unprivileged connect-scan fallback.
+var ErrPrivilegedRequired = errors.New("privileged execution is required: grant administrator/root access (macOS: approve the privileged helper with Touch ID; Windows: accept UAC and install Npcap)")
 
 // CommandRunner defines an interface for running external shell commands (enabling mocking).
 type CommandRunner interface {
@@ -53,7 +55,7 @@ func (r *DefaultCommandRunner) Run(ctx context.Context, name string, args ...str
 	return stdout.Bytes(), nil
 }
 
-// Scanner orchestrates Nmap discovery and vulnerability audits.
+// Scanner exposes the hybrid engine to the scheduler and storage layers.
 type Scanner struct {
 	cfg        *config.Config
 	runner     CommandRunner
@@ -99,7 +101,7 @@ func NewWithRunner(cfg *config.Config, runner CommandRunner, caps ...*model.Capa
 	return s
 }
 
-// SetNeighborSource sets where discovery reads recently resolved link-layer neighbors from.
+// SetNeighborSource sets where the engine reads recently resolved link-layer neighbors from.
 // A nil source turns the ARP table merge off.
 func (s *Scanner) SetNeighborSource(src NeighborSource) {
 	s.mu.Lock()
@@ -135,7 +137,7 @@ func (s *Scanner) SetExcludeIPs(ips ...string) {
 	s.excludeIPs = clean
 }
 
-// SetScanPorts updates the port range scanned during vulnerability audits.
+// SetScanPorts updates the port scope used by vulnerability audits.
 func (s *Scanner) SetScanPorts(ports string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -148,11 +150,15 @@ func (s *Scanner) excludedIPs() []string {
 	return append([]string(nil), s.excludeIPs...)
 }
 
-func (s *Scanner) getExcludeArgs() []string {
-	if excluded := s.excludedIPs(); len(excluded) > 0 {
-		return []string{"--exclude", strings.Join(excluded, ",")}
-	}
-	return nil
+// ExcludedIPs returns the addresses that must never be reported as discovered devices.
+func (s *Scanner) ExcludedIPs() []string {
+	return s.excludedIPs()
+}
+
+func (s *Scanner) neighborSource() NeighborSource {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.neighbors
 }
 
 func (s *Scanner) nmapBinary() string {
@@ -175,12 +181,38 @@ func (s *Scanner) usePrivilegedFlag() bool {
 	return s.caps != nil && s.caps.EffectiveMode == "privileged"
 }
 
-func isCompleteNmapOutput(output []byte) bool {
-	return bytes.Contains(output, []byte("<runstats>")) && bytes.Contains(output, []byte("exit=\"success\""))
+// CanScan reports whether the scanner has the privileged raw-socket access required to
+// run scans. There is deliberately no unprivileged fallback: when this is false the
+// scheduler skips scans and the UI must ask the user to grant administrator/root rights.
+func (s *Scanner) CanScan() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.caps != nil && s.caps.RawSocket && s.caps.EffectiveMode == "privileged"
 }
 
-// RunDiscoveryScan executes an Nmap host discovery scan against target CIDR.
-// Note: reverse DNS resolution is enabled (no -n flag) so live hosts report their local DNS/router hostnames.
+func (s *Scanner) portSpec() string {
+	s.mu.RLock()
+	if s.scanPorts != "" {
+		ports := s.scanPorts
+		s.mu.RUnlock()
+		return ports
+	}
+	s.mu.RUnlock()
+	if s.cfg != nil {
+		return strings.TrimSpace(s.cfg.ScanPorts)
+	}
+	return ""
+}
+
+func (s *Scanner) vulnScript() string {
+	if s.cfg != nil && s.cfg.VulnScript != "" {
+		return s.cfg.VulnScript
+	}
+	return "vulners"
+}
+
+// RunDiscoveryScan discovers live hosts on a CIDR or single address using the hybrid engine.
+// Reverse DNS is enabled so live hosts report their local DNS/router hostnames.
 func (s *Scanner) RunDiscoveryScan(ctx context.Context, target string) ([]model.Device, error) {
 	if strings.HasPrefix(target, "-") {
 		return nil, fmt.Errorf("invalid discovery target %q: target must not begin with '-'", target)
@@ -191,214 +223,57 @@ func (s *Scanner) RunDiscoveryScan(ctx context.Context, target string) ([]model.
 		}
 	}
 
-	// Proactively prod subnet with Stage 1 L2 sweep to wake sleeping devices and refresh ARP cache
-	if _, ipNet, err := net.ParseCIDR(target); err == nil && ipNet != nil {
-		s1Ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		_, _ = Stage1ARPSweep(s1Ctx, ipNet, s.excludedIPs())
-		cancel()
+	var subnet *net.IPNet
+	if _, parsed, err := net.ParseCIDR(target); err == nil {
+		subnet = parsed
 	}
 
-	// Most addresses in a LAN sweep are unused, and an unprivileged TCP ping waits for each
-	// probe to time out. A LAN answers in well under 500 ms, so the RTT cap, one retry and a
-	// higher minimum parallelism cut a /24 sweep from about 2.5 minutes to about 35 seconds.
-	// Hosts that miss the TCP probes are still found through the ARP table merge below.
-	args := []string{
-		"-sn",
-		"-T4",
-		"--max-retries", "1",
-		"--max-rtt-timeout", "500ms",
-		"--min-parallelism", "64",
-		"--host-timeout", "30s",
-		"-oX", "-",
-	}
-
-	if s.usePrivilegedFlag() {
-		args = append(args, "--privileged")
-	}
-
-	args = append(args, s.getExcludeArgs()...)
-	args = append(args, target)
-
-	output, err := s.runner.Run(ctx, s.nmapBinary(), args...)
-	if err != nil && !isCompleteNmapOutput(output) {
-		return nil, fmt.Errorf("discovery scan failed: %w", err)
-	}
-
-	run, parseErr := ParseNmapXML(output)
-	if parseErr != nil {
-		if err != nil {
-			return nil, err
-		}
-		return nil, fmt.Errorf("failed to parse discovery xml: %w", parseErr)
-	}
-
-	devices := ExtractDevices(run)
-	if entries := s.readNeighbors(ctx); entries != nil {
-		devices = mergeNeighbors(devices, entries, target, s.excludedIPs())
-	}
-	return devices, nil
+	engine := NewHybridEngine(s.runner)
+	engine.SetNeighborSource(s.neighborSource())
+	return engine.Discover(ctx, EngineOptions{
+		Target:     target,
+		Subnet:     subnet,
+		ExcludeIPs: s.excludedIPs(),
+		NmapBinary: s.nmapBinary(),
+		Privileged: s.usePrivilegedFlag(),
+	})
 }
 
-// readNeighbors returns the recently confirmed ARP entries, or nil when none can be read.
-func (s *Scanner) readNeighbors(ctx context.Context) []Neighbor {
-	s.mu.RLock()
-	neighbors := s.neighbors
-	s.mu.RUnlock()
-	if neighbors == nil {
-		return nil
-	}
-	entries, err := neighbors(ctx)
-	if err != nil {
-		log.Printf("[Scanner] Could not read the ARP table: %v", err)
-		return nil
-	}
-	return entries
+// ProbeKnownDevices runs the lightweight liveness check used between full sweeps. It only
+// touches the supplied addresses and never probes the rest of the subnet.
+func (s *Scanner) ProbeKnownDevices(ctx context.Context, targets []string) []model.Device {
+	return ProbeHosts(ctx, targets, s.neighborSource())
 }
 
-// RunVulnerabilityScan executes service detection, cryptographic identity scripts, and vulnerability scripts against target IPs.
+// RunVulnerabilityScan audits explicit target IPs through the same hybrid engine used by
+// discovery: L2 mapping, port discovery, then targeted service/vulnerability scripts.
 func (s *Scanner) RunVulnerabilityScan(ctx context.Context, targets []string) ([]model.ScanHostResult, error) {
 	if len(targets) == 0 {
 		return nil, nil
 	}
 
-	for _, target := range targets {
-		if strings.HasPrefix(target, "-") {
-			return nil, fmt.Errorf("invalid scan target %q: target must not begin with '-'", target)
-		}
-		if _, err := netip.ParseAddr(target); err != nil {
-			if _, err := netip.ParsePrefix(target); err != nil {
-				return nil, fmt.Errorf("invalid scan target %q: must be a valid IP address or CIDR prefix", target)
-			}
+	var subnet *net.IPNet
+	if s.cfg != nil {
+		if _, parsed, err := net.ParseCIDR(s.cfg.NetworkCIDR); err == nil {
+			subnet = parsed
 		}
 	}
 
-	vulnScript := s.cfg.VulnScript
-	if vulnScript == "" {
-		vulnScript = "vulners"
-	}
-	scriptSpec := vulnScript
-	if !strings.Contains(scriptSpec, "ssh-hostkey") {
-		scriptSpec += ",ssh-hostkey,ssl-cert"
-	}
-
-	// Tri-stage hybrid scanning:
-	// Stage 2 (RustScan) discovers open ports asynchronously across all 65,535 TCP ports.
-	// Stage 3 (Targeted Nmap) probes ONLY those open ports, eliminating closed-port timeout penalties.
-	if rustBin := platform.ResolveRustScan(); rustBin != "" {
-		rustCfg := DefaultRustScanConfig()
-		rustCfg.Binary = rustBin
-		openPortsMap, rErr := Stage2RustScan(ctx, targets, &rustCfg)
-		if rErr == nil {
-			macMap := make(map[string]string)
-			if entries := s.readNeighbors(ctx); entries != nil {
-				for _, n := range entries {
-					macMap[n.IP] = n.MAC
-				}
-			}
-			var stage3Targets []Stage3Target
-			for _, t := range targets {
-				stage3Targets = append(stage3Targets, Stage3Target{
-					IP:        t,
-					MAC:       macMap[t],
-					OpenPorts: openPortsMap[t],
-				})
-			}
-			results, auditErr := Stage3NmapAudit(ctx, s.runner, s.nmapBinary(), vulnScript, stage3Targets)
-			if auditErr == nil {
-				return results, nil
-			}
-		}
-	}
-
-	// nmap drops every result of a host that hits --host-timeout. Phones and routers that
-	// silently drop most of the 1000 probed ports need a few minutes over TCP connect, so the
-	// limit is generous; the whole scan stays bounded by ScanTimeout.
-	args := []string{
-		"-sV",
-		"--version-intensity", "5",
-		"-T4",
-		"--max-retries", "2",
-		"--host-timeout", "10m",
-		"--script", scriptSpec,
-		"-oX", "-",
-	}
-
-	if s.usePrivilegedFlag() {
-		args = append(args, "--privileged")
-	}
-
-	// Port specification: use configurable scan ports or default to top 1000 ports
-	scanPorts := ""
-	s.mu.RLock()
-	if s.scanPorts != "" {
-		scanPorts = s.scanPorts
-	} else if s.cfg != nil {
-		scanPorts = strings.TrimSpace(s.cfg.ScanPorts)
-	}
-	s.mu.RUnlock()
-
-	if scanPorts != "" {
-		if strings.HasPrefix(scanPorts, "--top-ports ") {
-			args = append(args, "--top-ports", strings.TrimSpace(strings.TrimPrefix(scanPorts, "--top-ports ")))
-		} else if strings.HasPrefix(scanPorts, "--top-ports=") {
-			args = append(args, "--top-ports", strings.TrimSpace(strings.TrimPrefix(scanPorts, "--top-ports=")))
-		} else if strings.HasPrefix(scanPorts, "-p ") {
-			args = append(args, "-p", strings.TrimSpace(strings.TrimPrefix(scanPorts, "-p ")))
-		} else if strings.HasPrefix(scanPorts, "-p") && len(scanPorts) > 2 && scanPorts[2] != ' ' {
-			args = append(args, "-p", strings.TrimSpace(strings.TrimPrefix(scanPorts, "-p")))
-		} else {
-			args = append(args, "-p", scanPorts)
-		}
-	} else {
-		// Default to top 1000 ports for fast, responsive scanning (covers 93% of open ports)
-		args = append(args, "--top-ports", "1000")
-	}
-
-	args = append(args, s.getExcludeArgs()...)
-	args = append(args, targets...)
-
-	output, err := s.runner.Run(ctx, s.nmapBinary(), args...)
-	if err != nil && !isCompleteNmapOutput(output) {
-		return nil, fmt.Errorf("vulnerability scan failed: %w", err)
-	}
-
-	run, parseErr := ParseNmapXML(output)
-	if parseErr != nil {
-		if err != nil {
-			return nil, err
-		}
-		return nil, fmt.Errorf("failed to parse vulnerability xml: %w", parseErr)
-	}
-
-	results := ExtractHostResults(run)
-	// Unprivileged scans cannot read MAC addresses. Without one, the identity matcher cannot
-	// tie the result to the device that discovery recorded with its MAC.
-	if entries := s.readNeighbors(ctx); entries != nil {
-		macs := make(map[string]string, len(entries))
-		for _, n := range entries {
-			macs[n.IP] = n.MAC
-		}
-		for i := range results {
-			if results[i].MAC == "" {
-				results[i].MAC = macs[results[i].IP]
-			}
-		}
-	}
-	return results, nil
-}
-
-// RunHybridScan executes the complete tri-stage pipeline (L2 ARP sweep -> RustScan -> Targeted Nmap audit)
-// with real-time lifecycle event dispatching.
-func (s *Scanner) RunHybridScan(ctx context.Context, subnet *net.IPNet, vulnScript string, listener ScanEventListener) ([]model.ScanHostResult, error) {
 	engine := NewHybridEngine(s.runner)
-	return engine.RunHybridScan(ctx, EngineOptions{
+	engine.SetNeighborSource(s.neighborSource())
+	return engine.Audit(ctx, targets, EngineOptions{
 		Subnet:     subnet,
 		ExcludeIPs: s.excludedIPs(),
 		NmapBinary: s.nmapBinary(),
 		RustBinary: platform.ResolveRustScan(),
-		VulnScript: vulnScript,
-		Listener:   listener,
+		VulnScript: s.vulnScript(),
+		Ports:      s.portSpec(),
+		Privileged: s.usePrivilegedFlag(),
 	})
+}
+
+func isCompleteNmapOutput(output []byte) bool {
+	return bytes.Contains(output, []byte("<runstats>")) && bytes.Contains(output, []byte("exit=\"success\""))
 }
 
 // DescribeScanError turns a scan failure into a message for the scan history. A scan cut

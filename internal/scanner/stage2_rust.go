@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"os/exec"
 	"regexp"
 	"sort"
 	"strconv"
@@ -31,7 +30,15 @@ type RustScanConfig struct {
 	BatchSize int           // default 4500
 	Timeout   time.Duration // default 500ms
 	Tries     int           // default 2
-	Binary    string
+	// ULimit is passed to RustScan's --ulimit. RustScan cannot exceed the process
+	// soft file-descriptor limit, so a low limit (launchd defaults to 256) silently
+	// serialises 4,500-port batches and turns a 25-second sweep into many minutes.
+	ULimit int // default 65535
+	Binary string
+	// Ports is empty (full 1-65535 range), a range such as "1-10000", or a
+	// comma-separated list such as "22,80,443". Empty must never fall back to
+	// RustScan's top-1,000 list: IoT devices commonly listen on non-standard high ports.
+	Ports string
 }
 
 // DefaultRustScanConfig returns Profile P-02 (Balanced Sentinel) parameters.
@@ -40,15 +47,26 @@ func DefaultRustScanConfig() RustScanConfig {
 		BatchSize: 4500,
 		Timeout:   500 * time.Millisecond,
 		Tries:     2,
+		ULimit:    65535,
 		Binary:    platform.ResolveRustScan(),
+		Ports:     "1-65535",
 	}
 }
 
 // Stage2RustScan executes Profile P-02 async port discovery across all 65,535 TCP ports for target IPs.
 // It returns a mapping of IP -> list of verified open ports.
 func Stage2RustScan(ctx context.Context, targetIPs []string, cfg *RustScanConfig) (map[string][]int, error) {
+	return Stage2RustScanWithRunner(ctx, &DefaultCommandRunner{}, targetIPs, cfg)
+}
+
+// Stage2RustScanWithRunner is Stage2RustScan using the supplied command runner, so the
+// engine's helper/elevation path and unit-test mocks apply to RustScan as well.
+func Stage2RustScanWithRunner(ctx context.Context, runner CommandRunner, targetIPs []string, cfg *RustScanConfig) (map[string][]int, error) {
 	if len(targetIPs) == 0 {
 		return make(map[string][]int), nil
+	}
+	if runner == nil {
+		runner = &DefaultCommandRunner{}
 	}
 
 	var conf RustScanConfig
@@ -70,6 +88,14 @@ func Stage2RustScan(ctx context.Context, targetIPs []string, cfg *RustScanConfig
 	if conf.Tries <= 0 {
 		conf.Tries = 2
 	}
+	if conf.ULimit <= 0 {
+		conf.ULimit = 65535
+	}
+	// RustScan needs a descriptor per in-flight connection plus headroom for its
+	// runtime. Keep the requested limit at least one batch above the batch size.
+	if minLimit := conf.BatchSize + 256; conf.ULimit < minLimit {
+		conf.ULimit = minLimit
+	}
 
 	// Build arguments matching Profile P-02 (Balanced Sentinel)
 	args := []string{
@@ -77,27 +103,29 @@ func Stage2RustScan(ctx context.Context, targetIPs []string, cfg *RustScanConfig
 		"--batch-size", strconv.Itoa(conf.BatchSize),
 		"--timeout", strconv.Itoa(int(conf.Timeout.Milliseconds())),
 		"--tries", strconv.Itoa(conf.Tries),
+		"--ulimit", strconv.Itoa(conf.ULimit),
 		"--scan-order", "random",
 		"--scripts", "none",
 		"--no-banner",
 	}
-
-	cmd := exec.CommandContext(ctx, conf.Binary, args...)
-	configureProcessGroup(cmd)
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	err := cmd.Run()
-	if err != nil {
-		// Even if process exited with non-zero, parse whatever stdout was produced
-		if stdout.Len() == 0 {
-			return nil, fmt.Errorf("rustscan failed: %w (stderr: %s)", err, strings.TrimSpace(stderr.String()))
-		}
+	ports := strings.TrimSpace(conf.Ports)
+	switch {
+	case ports == "":
+		// A full sweep is the default. Never use "--top" here: it hides services on
+		// non-standard high ports, which is exactly where IoT devices tend to listen.
+		args = append(args, "--range", "1-65535")
+	case strings.Contains(ports, "-") && !strings.Contains(ports, ","):
+		args = append(args, "--range", ports)
+	default:
+		args = append(args, "--ports", ports)
 	}
 
-	return ParseRustScanOutput(stdout.Bytes())
+	output, err := runner.Run(ctx, conf.Binary, args...)
+	if err != nil && len(output) == 0 {
+		return nil, fmt.Errorf("rustscan failed: %w", err)
+	}
+
+	return ParseRustScanOutput(output)
 }
 
 // ParseRustScanOutput strictly parses stdout from RustScan, preventing the Port 192 artifact.

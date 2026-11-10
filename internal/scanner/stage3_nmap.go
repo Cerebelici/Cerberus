@@ -91,7 +91,6 @@ func Stage3NmapAudit(ctx context.Context, runner CommandRunner, nmapBinary strin
 			"-oX", "-",
 			target.IP,
 		}
-
 		output, err := runner.Run(ctx, nmapBinary, args...)
 		if err != nil && !isCompleteNmapOutput(output) {
 			// Partial or failed execution: still try to parse if valid XML
