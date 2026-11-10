@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.cerberus.helper</string>
+    <key>CFBundleName</key>
+    <string>Cerberus Privileged Helper</string>
+    <key>CFBundleExecutable</key>
+    <string>com.cerberus.helper</string>
+    <key>CFBundlePackageType</key>
+    <string>TOOL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundleVersion</key>
+    <string>1.0.0</string>
+    <!--
+      Clients allowed to install/connect to this helper. Keep this in sync with
+      SMPrivilegedExecutables in desktop/build/darwin/Info.plist.
+
+      For a Developer ID release, tighten this to:
+        identifier "io.github.gr0gu.cerberus" and anchor apple generic
+      and sign both the app and helper with the same Developer ID identity.
+      An ad-hoc signed development build only satisfies the bare identifier form.
+    -->
+    <key>SMAuthorizedClients</key>
+    <array>
+        <string>identifier "io.github.gr0gu.cerberus"</string>
+    </array>
+</dict>
+</plist>

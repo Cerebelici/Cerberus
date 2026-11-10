@@ -9,6 +9,8 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/user"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -61,7 +63,14 @@ func (s *IPCServer) Start() error {
 		return fmt.Errorf("binding socket %s: %w", s.socketPath, err)
 	}
 
-	// Restrict permissions to 0660 (root + wheel group)
+	// The desktop app runs as an admin user, not as root. On macOS the socket is owned
+	// by root:admin with mode 0660, so administrators can connect without granting every
+	// local account access. Non-macOS helpers are not used by the desktop app.
+	if grp, err := user.LookupGroup("admin"); err == nil {
+		if gid, convErr := strconv.Atoi(grp.Gid); convErr == nil {
+			_ = os.Chown(s.socketPath, 0, gid)
+		}
+	}
 	if err := os.Chmod(s.socketPath, 0660); err != nil {
 		_ = l.Close()
 		return fmt.Errorf("setting socket permissions: %w", err)

@@ -10,3 +10,6 @@ import (
 func VerifyPeerCredentials(conn net.Conn) (uint32, error) {
 	return 0, nil
 }
+
+// RaiseFileLimit is a no-op outside macOS.
+func RaiseFileLimit() {}

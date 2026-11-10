@@ -8,7 +8,7 @@
         <key>CFBundleExecutable</key>
         <string>{{.OutputFilename}}</string>
         <key>CFBundleIdentifier</key>
-        <string>com.wails.{{safeBundleID .Name}}</string>
+        <string>io.github.gr0gu.cerberus</string>
         <key>CFBundleVersion</key>
         <string>{{.Info.ProductVersion}}</string>
         <key>CFBundleGetInfoString</key>
@@ -25,6 +25,11 @@
         <string>{{.Info.Copyright}}</string>
         <key>NSLocalNetworkUsageDescription</key>
         <string>Cerberus Sentinel scans your local network to find devices, open services and known vulnerabilities.</string>
+        <key>SMPrivilegedExecutables</key>
+        <dict>
+            <key>com.cerberus.helper</key>
+            <string>identifier "com.cerberus.helper"</string>
+        </dict>
         {{if .Info.FileAssociations}}
         <key>CFBundleDocumentTypes</key>
         <array>

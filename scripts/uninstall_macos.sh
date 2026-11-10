@@ -27,6 +27,9 @@ HELPER_SOCK="/var/run/com.cerberus.helper.sock"
 
 if [ -f "${HELPER_PLIST}" ] || [ -f "${HELPER_BIN}" ] || [ -S "${HELPER_SOCK}" ]; then
   echo "--> Removing privileged helper daemon (requires sudo)..."
+  # SMJobBless registers the job with launchd directly, so remove the job as well as files.
+  sudo launchctl bootout system/com.cerberus.helper 2>/dev/null || true
+  sudo launchctl remove com.cerberus.helper 2>/dev/null || true
   sudo launchctl unload "${HELPER_PLIST}" 2>/dev/null || true
   sudo rm -f "${HELPER_PLIST}"
   sudo rm -f "${HELPER_BIN}"
@@ -48,6 +51,8 @@ fi
 
 rm -rf "${HOME}/Library/Caches/cerberus"
 rm -rf "${HOME}/Library/Saved Application State/com.cerberus.desktop.savedState"
+rm -rf "${HOME}/Library/Saved Application State/io.github.gr0gu.cerberus.savedState"
+rm -rf "${HOME}/Library/Saved Application State/com.wails.cerberus.savedState"
 rm -rf "${HOME}/Library/Saved Application State/cerberus.savedState"
 rm -f "${HOME}/Library/Preferences/com.cerberus.*" 2>/dev/null || true
 

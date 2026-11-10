@@ -18,6 +18,7 @@ func main() {
 	}
 
 	executor := NewRootExecutor()
+	RaiseFileLimit()
 	server := NewIPCServer(sockPath, executor)
 
 	if err := server.Start(); err != nil {

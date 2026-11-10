@@ -98,6 +98,12 @@ jobs:
 
       # -----------------------------------------------------------------------
       # ZERO-PREREQUISITE BUNDLED ENGINES PREPARATION (STAGED IN desktop/tools)
+      #
+      # Windows note: nmap.exe is extracted from the official installer, so no
+      # nmap-setup.exe is shipped. Npcap is NOT bundled (its installer must run
+      # separately and is licensed by its authors). The app requests elevation via
+      # wails.exe.manifest and requires Npcap for raw/SYN scans; there is no
+      # connect-scan (-sT) fallback.
       # -----------------------------------------------------------------------
       - name: Prepare Windows Bundled Engines
         if: runner.os == 'Windows'
@@ -210,6 +216,9 @@ jobs:
           # Inject staged tools into the compiled .app bundle
           mkdir -p "${APP_DIR}/Contents/Resources/bin"
           cp -R tools/* "${APP_DIR}/Contents/Resources/bin/"
+          # build-dmg.sh rebuilds, injects and signs the SMJobBless helper. Set
+          # CERBERUS_CODESIGN_IDENTITY to a Developer ID for a distributable build; the
+          # ad-hoc default cannot bless the helper, so scanning stays disabled in it.
           codesign --force --deep --sign - "${APP_DIR}"
 
           chmod +x packaging/darwin/build-dmg.sh
